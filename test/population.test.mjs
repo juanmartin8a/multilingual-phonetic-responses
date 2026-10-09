@@ -33,7 +33,7 @@ function fixture(extra = {}) {
 }
 
 function configured(argv = [], env = {}, settings = {}) {
-  return configuration(argv, env, () => typeof settings === 'string' ? settings : JSON.stringify(settings));
+  return configuration('transcriptions', argv, env, () => typeof settings === 'string' ? settings : JSON.stringify(settings));
 }
 
 function assertNoCredentials(cfg, directory = cfg.stateDir) {
@@ -268,26 +268,42 @@ test('config files are selected explicitly and YAML paths resolve relative to th
   temporaryDirectories.push(directory);
   const path = join(directory, 'settings.yml');
   writeFileSync(path, 'project: ./checkout\nstateDir: ./state\nlimits:\n  maxUsd: "0.25"\n');
-  const cfg = configuration(['--config', path], {});
+  const cfg = configuration('transcriptions', ['--config', path], {});
   assert.equal(cfg.project, join(directory, 'checkout'));
   assert.equal(cfg.stateDir, join(directory, 'state'));
   assert.equal(cfg.budget, 250000000);
   assert.equal(cfg.generate, false);
-  const overridden = configuration(['--config', path, '--project', directory, '--state-dir', directory], {});
+  const overridden = configuration('transcriptions', ['--config', path, '--project', directory, '--state-dir', directory], {});
   assert.equal(overridden.project, directory);
   assert.equal(overridden.stateDir, directory);
-  assert.throws(() => configuration(['--config', join(directory, 'missing.yml')], {}), /ENOENT/);
-  assert.deepEqual(configuration(['--help', '--config', '/missing'], {}), { help: true });
-  const defaultPath = new URL('../config.yml', import.meta.url);
-  const defaults = configuration([], {});
-  assert.equal(defaults.budget, 1e9);
-  assert.equal(defaults.project, join(homedir(), 'development/react-native/sapo'));
-  assert.equal(defaults.generate, false);
-  assert.equal(defaults.write, false);
-  configuration([], {}, (selected, encoding) => {
-    assert.equal(selected, defaultPath.pathname);
-    return readFileSync(defaultPath, encoding);
-  });
+  assert.throws(() => configuration('transcriptions', ['--config', join(directory, 'missing.yml')], {}), /ENOENT/);
+  assert.deepEqual(configuration('transcriptions', ['--help', '--config', '/missing'], {}), { help: true });
+  for (const task of ['transcriptions', 'respellings']) {
+    const defaultPath = new URL(`../config/${task}.yml`, import.meta.url);
+    const defaults = configuration(task, [], {}, (selected, encoding) => {
+      assert.equal(selected, defaultPath.pathname);
+      return readFileSync(defaultPath, encoding);
+    });
+    assert.equal(defaults.budget, 1e9);
+    assert.equal(defaults.project, join(homedir(), 'development/react-native/sapo'));
+    assert.equal(defaults.generate, false);
+    assert.equal(defaults.write, false);
+    const custom = configuration(task, ['--config', path], {});
+    assert.equal(custom.budget, 250000000);
+    assert.equal(custom.stateDir, join(directory, 'state'));
+  }
+});
+
+test('script defaults load only their own settings while preserving the shared ledger', () => {
+  const settings = { transcriptions: 'batchSize: 5', respellings: 'batchSize: 10' };
+  const configs = Object.entries(settings).map(([task, text]) => configuration(task, [], {}, (selected) => {
+    assert.equal(selected, new URL(`../config/${task}.yml`, import.meta.url).pathname);
+    return text;
+  }));
+  assert.equal(configs[0].batchSize, 5);
+  assert.equal(configs[1].batchSize, 10);
+  assert.equal(configs[0].stateDir, configs[1].stateDir);
+  assert.throws(() => configuration('unknown', [], {}), /Unknown population task/);
 });
 
 test('Bun only loads explicitly selected environment files, even with NODE_ENV=production', () => {

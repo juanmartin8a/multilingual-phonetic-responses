@@ -1,10 +1,10 @@
-# Non-secret settings. CLI options override these values.
+# Settings for populate-respellings.mjs only. CLI options override these values.
 # Monetary values are quoted to preserve exact decimal amounts.
 project: ~/development/react-native/sapo
 batchSize: 20
 # Paths in YAML are relative to this file. The default state directory is
 # <script-dir>/.state; changing it creates a separate spending ledger.
-# stateDir: ./.state
+# stateDir: ../.state
 # maxPages: 1  # Omit: planning reads one page; generation scans all pages.
 
 ai:
@@ -34,7 +34,8 @@ limits:
 #   accountId: YOUR_32_HEX_ACCOUNT_ID
 #   gatewayId: YOUR_GATEWAY_ID
 
-# Optional dialect/script overrides keyed by language code.
+# Source dialect and target native-script overrides for respelling generation.
+# Also used when generating missing source IPA.
 # Script is a JavaScript Unicode script name, or "Japanese".
 languagePolicies: {}
 # languagePolicies:

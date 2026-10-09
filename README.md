@@ -32,8 +32,9 @@ Check `bun --version` before running. No `bun install` is needed here.
    scoped to your account (not Workers AI Read). Enable **Authenticated Gateway**
    and **Require provider credentials** in the gateway settings. No Cloudflare
    Unified Billing credits are required, and no OpenAI key is needed locally.
-4. Edit `config.yml` for non-secret settings. Uncomment `cloudflare` and enter
-   your account and gateway IDs before generating. Keep API tokens and deployment
+4. Edit `config/transcriptions.yml` or `config/respellings.yml` for the script
+   you want to run. Uncomment `cloudflare` and enter your account and gateway
+   IDs in that file before generating. Keep API tokens and deployment
    keys out of YAML; only `.env` or shell variables supply credentials.
 
 Neither script accepts a database URL or a production switch. Both require the
@@ -44,7 +45,7 @@ local deployments, redirects, and mismatched URLs are rejected.
 
 ## Run
 
-From `~/development/js/scripts/sapo`:
+From `~/development/js/sapo-mpr`:
 
 ```sh
 # First-page read-only plans. No model call; no database mutation.
@@ -72,10 +73,14 @@ parsed read-only and never loaded into the script's environment.
 
 ### Configuration
 
-`config.yml` beside the scripts is the default settings file, independent of the
-shell's working directory. Use `--config path/to/settings.yml` to select another
-file explicitly; files are not automatically merged. YAML is parsed by Bun's
-built-in parser, so no package installation is needed.
+`populate-transcriptions.mjs` defaults to `config/transcriptions.yml`;
+`populate-respellings.mjs` defaults to `config/respellings.yml`. Each file contains
+only settings for its script, so changing one does not change the other. Both
+scripts share parsing and validation code, but never load each other's settings.
+Default config paths are independent of the shell's working directory. Use
+`--config path/to/settings.yml` to replace the selected script's config explicitly;
+files are not merged. YAML is parsed by Bun's built-in parser, so no package
+installation is needed.
 
 Precedence is **CLI options > YAML settings > safe built-in defaults**. Environment
 variables supply only `SAPO_CONVEX_DEV_KEY` and `CLOUDFLARE_API_TOKEN`; the old
@@ -91,13 +96,18 @@ under `limits`, and account identifiers under `cloudflare`. `project`, `stateDir
 fields and invalid types/values are rejected. Quote monetary values to preserve
 exact decimals; integer limits use YAML numbers. Paths in YAML are relative to
 the selected config file (`~/` is supported); CLI paths are relative to the shell.
-Omitting `stateDir` keeps the shared `<script-dir>/.state` ledger.
+For these files in `config/`, `stateDir: ../.state` refers to the existing shared
+ledger. Omitting `stateDir` also keeps the shared `<script-dir>/.state` ledger.
+Configuration independence does not split spending: both scripts retain that
+ledger and lock unless you explicitly select different state directories.
+`languagePolicies` in the transcription config controls source pronunciation;
+in the respelling config it controls source pronunciation and target scripts.
 
 ```sh
-bun --env-file=.env populate-transcriptions.mjs --config ./config.yml --generate --budget 1
+bun --env-file=.env populate-transcriptions.mjs --config ./config/transcriptions.yml --generate --budget 1
 ```
 
-`config.yml` can be committed because it contains no credentials. All `.env*`
+Both `config/*.yml` files can be committed because they contain no credentials. All `.env*`
 files except `.env.example` are ignored by Git. The SAPO checkout's deployment
 environment files still serve only as read-only development-target safety checks.
 
