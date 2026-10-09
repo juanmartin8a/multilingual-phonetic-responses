@@ -1,0 +1,42 @@
+# Non-secret settings. CLI options override these values.
+# Monetary values are quoted to preserve exact decimal amounts.
+project: ~/development/react-native/sapo
+batchSize: 20
+# Paths in YAML are relative to this file. The default state directory is
+# <script-dir>/.state; changing it creates a separate spending ledger.
+# stateDir: ./.state
+# maxPages: 1  # Omit: planning reads one page; generation scans all pages.
+
+ai:
+  provider: openai
+  model: gpt-6.1-sol
+  api: responses
+  reasoningEffort: high
+  maxOutputTokens: 25000
+  # Standard, non-regional GPT-6.1 Sol prices, USD/million tokens (2026-10-08).
+  # Change provider/model and all four prices together; include gateway premiums.
+  pricesUsdPerMillion:
+    input: "2"
+    cachedInput: "0.1"
+    cacheWrite: "2.5"
+    output: "10"
+
+limits:
+  maxUsd: "1"  # Cumulative cap across both scripts and all resumes.
+  requestsPerMinute: 10
+  tokensPerMinute: 200000
+  maxAttempts: 3
+  timeoutMs: 300000
+
+# Non-secret account identifiers. Required only for --generate.
+# cloudflare:
+#   accountId: YOUR_32_HEX_ACCOUNT_ID
+#   gatewayId: YOUR_GATEWAY_ID
+
+# Optional dialect/script overrides keyed by language code.
+# Script is a JavaScript Unicode script name, or "Japanese".
+languagePolicies: {}
+# languagePolicies:
+#   es:
+#     dialect: neutral Latin American Spanish
+#     script: Latin
