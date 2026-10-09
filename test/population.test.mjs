@@ -27,13 +27,25 @@ function fixture(extra = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'sapo-phonetics-'));
   temporaryDirectories.push(stateDir);
   const cfg = { ...configured(['--generate', '--budget', '10'], {
-    CLOUDFLARE_API_TOKEN: 'fake',
+    CLOUDFLARE_API_TOKEN: 'fake-gateway-token',
   }, { cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' } }), stateDir, identity, ...extra };
   return cfg;
 }
 
 function configured(argv = [], env = {}, settings = {}) {
   return configuration(argv, env, () => typeof settings === 'string' ? settings : JSON.stringify(settings));
+}
+
+function assertNoCredentials(cfg, directory = cfg.stateDir) {
+  for (const file of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, file.name);
+    if (file.isDirectory()) assertNoCredentials(cfg, path);
+    else {
+      const text = readFileSync(path, 'utf8');
+      assert.equal(text.includes('fake-openai-key'), false, `OpenAI key leaked to ${file.name}`);
+      assert.equal(text.includes(cfg.token), false, `Gateway token leaked to ${file.name}`);
+    }
+  }
 }
 
 function answer(records, extra = {}) {
@@ -48,13 +60,16 @@ const row = (key, value = '/həˈloʊ/') => ({ key, status: 'ready', value, note
 function fakeFetch(counter, transform) {
   return async (url, options) => {
     counter.calls++;
-    assert.match(url, /^https:\/\/api\.cloudflare\.com\/client\/v4\/accounts\/[a-f0-9]{32}\/ai\/v1\/responses$/);
+    assert.equal(url, `https://gateway.ai.cloudflare.com/v1/${'a'.repeat(32)}/test/openai/responses`);
     assert.equal(options.redirect, 'error');
     assert.equal(options.headers['cf-aig-max-attempts'], '1');
-    assert.equal(options.headers['cf-aig-gateway-id'], 'test');
+    assert.equal(new Headers(options.headers).has('authorization'), false);
+    assert.equal(options.headers['cf-aig-authorization'], 'Bearer fake-gateway-token');
+    assert.equal(options.headers['cf-aig-no-wholesale'], 'true');
+    assert.equal(options.headers['cf-aig-gateway-id'], undefined);
     const body = JSON.parse(options.body);
     assert.deepEqual(body.reasoning, { effort: 'high' });
-    assert.equal(body.model, 'openai/gpt-6.1-sol');
+    assert.equal(body.model, 'gpt-6.1-sol');
     assert.equal(body.temperature, undefined);
     const input = JSON.parse(body.input[1].content);
     const records = input.words.map((job) => input.target ? row(job.key, 'jelóu') : row(job.key));
@@ -125,6 +140,7 @@ test('configuration is safe by default and custom models require explicit prices
   assert.throws(() => configured(['--provider', 'anthropic']));
   assert.throws(() => configured(['--batch-size', '0']));
   assert.throws(() => configured(['--prod']));
+  assert.throws(() => configured(['--model', 'openai/gpt-6.1-sol']), /native OpenAI/);
   assert.equal(usd('0.123456789'), 123456789);
   assert.throws(() => usd('-1'));
   assert.equal(configured([], {}, { ai: { pricesUsdPerMillion: { input: '1.001' } } }).prices.input, 1001);
@@ -135,7 +151,7 @@ test('configuration is safe by default and custom models require explicit prices
 
 test('YAML settings, CLI overrides, and credential-only environment variables', () => {
   const cfg = configured(['--budget', '0.123456789', '--batch-size', '5', '--max-pages', '2'], {
-    SAPO_CONVEX_DEV_KEY: 'dev:test-dev|fake', CLOUDFLARE_API_TOKEN: 'fake',
+    SAPO_CONVEX_DEV_KEY: 'dev:test-dev|fake', CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: 'fake-openai-key',
     AI_PROVIDER: 'ignored', AI_MODEL: 'ignored', AI_API: 'ignored', AI_REASONING_EFFORT: 'none',
     AI_INPUT_USD_PER_M: '999', SAPO_MAX_USD: '999', AI_MAX_OUTPUT_TOKENS: '1',
     AI_REQUESTS_PER_MINUTE: '999', AI_TOKENS_PER_MINUTE: '1', AI_MAX_ATTEMPTS: '999', AI_TIMEOUT_MS: '1',
@@ -184,6 +200,7 @@ languagePolicies:
   assert.equal(cfg.account, 'a'.repeat(32));
   assert.equal(cfg.gateway, 'test');
   assert.equal(cfg.token, 'fake');
+  assert.equal(cfg.openaiKey, undefined);
   assert.equal(cfg.devKey, 'dev:test-dev|fake');
   assert.equal(cfg.generate, false);
   assert.equal(cfg.write, false);
@@ -193,6 +210,7 @@ languagePolicies:
 test('YAML rejects unknown settings, invalid types, invalid policies, and unsafe limits', () => {
   for (const settings of [
     { generate: true }, { write: true }, { token: 'secret' }, { cloudflare: { apiToken: 'secret' } },
+    { ai: { apiKey: 'secret' } }, { openaiKey: 'secret' },
     { ai: { modle: 'typo' } }, { limits: { maxUsd: 1 } }, { ai: { pricesUsdPerMillion: { input: 2 } } },
     { batchSize: true }, { batchSize: null }, { batchSize: 1.5 }, { batchSize: 0 },
     { ai: [] }, { ai: { model: '' } }, { ai: { api: 'invalid' } },
@@ -206,13 +224,13 @@ test('YAML rejects unknown settings, invalid types, invalid policies, and unsafe
   for (const text of ['', 'null', '[]', 'ai: [']) assert.throws(() => configured([], {}, text));
   assert.throws(() => configured([], {}, 'batchSize: .nan'));
   assert.throws(() => configured(['--generate', '--budget', '1']), /Cloudflare/);
-  assert.throws(() => configured(['--generate'], { CLOUDFLARE_API_TOKEN: 'fake' }, {
+  assert.throws(() => configured(['--generate'], { CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: 'fake-openai-key' }, {
     cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' },
   }), /positive/);
 });
 
 test('alternate YAML models require complete prices and cannot reuse another model price table', () => {
-  const ai = { provider: 'anthropic', model: 'test-model', reasoningEffort: 'omit',
+  const ai = { provider: 'openai', model: 'test-model', api: 'chat', reasoningEffort: 'omit',
     pricesUsdPerMillion: { input: '1', cachedInput: '1', cacheWrite: '1', output: '2' } };
   assert.equal(configured([], {}, { ai }).api, 'chat');
   for (const name of Object.keys(ai.pricesUsdPerMillion)) {
@@ -221,7 +239,28 @@ test('alternate YAML models require complete prices and cannot reuse another mod
     assert.throws(() => configured([], {}, { ai: { ...ai, pricesUsdPerMillion: prices } }), /four explicit/);
   }
   assert.throws(() => configured(['--model', 'different-model'], {}, { ai }), /does not match/);
-  assert.throws(() => configured(['--provider', 'other'], {}, { ai }), /does not match/);
+  assert.throws(() => configured(['--provider', 'other'], {}, { ai }), /only openai/);
+});
+
+test('generation needs only gateway credentials and ignores local OpenAI keys', () => {
+  const settings = { cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' } };
+  for (const key of [undefined, '', '   ', 'fake-openai-key']) {
+    const cfg = configured(['--generate', '--budget', '1'], {
+      CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: key,
+    }, settings);
+    assert.equal(cfg.generate, true);
+    assert.equal(cfg.openaiKey, undefined);
+  }
+  assert.throws(() => configured(['--generate', '--budget', '1'], {
+    OPENAI_API_KEY: 'fake-openai-key',
+  }, settings), /Cloudflare/);
+  assert.equal(configured([], {}, settings).generate, false);
+  for (const provider of ['anthropic', 'workers-ai']) {
+    assert.throws(() => configured([], {}, { ai: { provider } }), /only openai/);
+    assert.throws(() => createAI(fixture({ provider })), /OpenAI gateway/);
+  }
+  assert.ok(createAI(fixture()));
+  assert.throws(() => createAI(fixture({ token: undefined })), /CLOUDFLARE_API_TOKEN/);
 });
 
 test('config files are selected explicitly and YAML paths resolve relative to the selected file', () => {
@@ -364,6 +403,7 @@ test('successful output is cached per item and billed once across restart and ba
   const saved = readJson(join(cfg.stateDir, 'results', readdirSync(join(cfg.stateDir, 'results'))[0]));
   assert.ok(saved.job.word);
   assert.equal(saved.source.code, 'en');
+  assertNoCredentials(cfg);
 });
 
 test('saved request artifact recovers a crash before settlement without a second AI request', async () => {
@@ -426,15 +466,19 @@ test('persistent rolling RPM rate limiting survives process restart', async () =
   assert.equal(count.calls, 2);
 });
 
-test('custom provider chat requests still use Cloudflare and settle normalized usage', async () => {
-  const cfg = fixture({ provider: 'anthropic', model: 'test-model', builtIn: false,
+test('alternate OpenAI chat models use the provider-native gateway and settle usage', async () => {
+  const cfg = fixture({ model: 'test-model', builtIn: false,
     api: 'chat', effort: 'omit', prices: { input: 1000, cached: 1000, write: 1000, output: 2000 } });
   let calls = 0;
   const ai = createAI(cfg, { fetchFn: async (url, options) => {
     calls++;
-    assert.match(url, /api\.cloudflare\.com.*\/ai\/v1\/chat\/completions$/);
+    assert.equal(url, `https://gateway.ai.cloudflare.com/v1/${cfg.account}/${cfg.gateway}/openai/chat/completions`);
+    assert.equal(options.redirect, 'error');
+    assert.equal(new Headers(options.headers).has('authorization'), false);
+    assert.equal(options.headers['cf-aig-authorization'], `Bearer ${cfg.token}`);
+    assert.equal(options.headers['cf-aig-no-wholesale'], 'true');
     const body = JSON.parse(options.body);
-    assert.equal(body.model, 'anthropic/test-model');
+    assert.equal(body.model, 'test-model');
     assert.equal(body.reasoning_effort, undefined);
     assert.equal(body.response_format.json_schema.strict, true);
     const input = JSON.parse(body.messages[1].content);
@@ -444,6 +488,32 @@ test('custom provider chat requests still use Cloudflare and settle normalized u
   await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
   assert.equal(calls, 1);
   assert.equal(ai.totals().known, 200000);
+  assertNoCredentials(cfg);
+});
+
+test('stored-key failures and redirects never fall back or persist echoed credentials', async () => {
+  for (const status of [400, 401, 403, 302]) {
+    const cfg = fixture();
+    let calls = 0;
+    const logs = [];
+    const ai = createAI(cfg, { log: (text) => logs.push(text), fetchFn: async (url, options) => {
+      calls++;
+      assert.equal(url, `https://gateway.ai.cloudflare.com/v1/${cfg.account}/${cfg.gateway}/openai/responses`);
+      assert.equal(options.redirect, 'error');
+      assert.equal(new Headers(options.headers).has('authorization'), false);
+      assert.equal(options.headers['cf-aig-no-wholesale'], 'true');
+      return new Response(JSON.stringify({
+        error: { message: `Invalid credentials: fake-openai-key ${cfg.token}` },
+        ...(status === 401 ? { usage: answer([]).usage, service_tier: 'default' } : {}),
+      }), { status, headers: { Location: 'https://api.openai.com/v1/responses' } });
+    } });
+    await assert.rejects(ai.generate('ipa', [{ key: '1', word: 'hello' }], source), new RegExp(`HTTP ${status}`));
+    assert.equal(calls, 1);
+    assert.equal(ai.totals().known, status === 401 ? 7150000 : 0);
+    assertNoCredentials(cfg);
+    assert.equal(logs.join().includes('fake-openai-key'), false);
+    assert.equal(logs.join().includes(cfg.token), false);
+  }
 });
 
 test('the same ledger cap applies to IPA and respelling tasks', async () => {

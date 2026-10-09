@@ -8,13 +8,14 @@ batchSize: 20
 # maxPages: 1  # Omit: planning reads one page; generation scans all pages.
 
 ai:
+  # OpenAI calls use AI Gateway's provider-native endpoint and stored provider key.
   provider: openai
   model: gpt-6.1-sol
   api: responses
   reasoningEffort: high
   maxOutputTokens: 25000
   # Standard, non-regional GPT-6.1 Sol prices, USD/million tokens (2026-10-08).
-  # Change provider/model and all four prices together; include gateway premiums.
+  # Change model and all four prices together; use your actual OpenAI rates.
   pricesUsdPerMillion:
     input: "2"
     cachedInput: "0.1"

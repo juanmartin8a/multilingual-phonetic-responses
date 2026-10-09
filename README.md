@@ -23,9 +23,15 @@ Check `bun --version` before running. No `bun install` is needed here.
    Preserve/deploy the existing pronunciation schema and helpers they import.
 3. Copy `.env.example` to `.env` here and fill in credentials. The Convex key must
    be a `dev:<name>|...` deployment key for SAPO's `.env.local` deployment.
-   The Cloudflare token needs **Account > Workers AI > Read** for the current
-   REST API. Enable Unified Billing credits and verify `openai/gpt-6.1-sol`
-   availability in the account. Select the intended gateway ID.
+   In Cloudflare **AI > AI Gateway**, create/select your gateway, then go to
+   **Provider Keys > Add API Key**. Select **OpenAI**, enter your OpenAI project
+   key, and save it with alias **default**. Verify your OpenAI project has API
+   billing enabled and access to `gpt-6.1-sol`. Open the gateway's
+   **Settings > Create authentication token**, and save the
+   token as `CLOUDFLARE_API_TOKEN`. The token needs **Account > AI Gateway > Run**,
+   scoped to your account (not Workers AI Read). Enable **Authenticated Gateway**
+   and **Require provider credentials** in the gateway settings. No Cloudflare
+   Unified Billing credits are required, and no OpenAI key is needed locally.
 4. Edit `config.yml` for non-secret settings. Uncomment `cloudflare` and enter
    your account and gateway IDs before generating. Keep API tokens and deployment
    keys out of YAML; only `.env` or shell variables supply credentials.
@@ -76,6 +82,8 @@ variables supply only `SAPO_CONVEX_DEV_KEY` and `CLOUDFLARE_API_TOKEN`; the old
 `AI_*`, `SAPO_MAX_USD`, account/gateway, and language-policy environment settings
 are no longer read. Move any existing values into the corresponding YAML sections.
 `--generate` and `--write` remain explicit CLI permissions, never YAML settings.
+`OPENAI_API_KEY` is not read; store your provider key in the gateway dashboard,
+not in local environment files. The gateway uses the OpenAI key's `default` alias.
 
 The file groups model/output settings under `ai`, spending/rate/retry settings
 under `limits`, and account identifiers under `cloudflare`. `project`, `stateDir`,
@@ -146,29 +154,36 @@ so a completed scan does **not** imply every word was safely transcribable.
 
 ## Gateway, usage, and costs
 
-All inference goes through Cloudflare's current `/ai/v1/responses` or
-`/ai/v1/chat/completions` REST API, with `cf-aig-gateway-id`. No direct provider
-requests, tools, web searches, background jobs, or hidden SDK retries are used.
-Defaults: `openai/gpt-6.1-sol`, `reasoning.effort: high`, standard service tier,
+All inference goes through AI Gateway's OpenAI provider-native endpoints:
+`https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/openai/responses`
+or `/openai/chat/completions`. Only
+`cf-aig-authorization: Bearer <CLOUDFLARE_API_TOKEN>` is sent for authentication.
+There is no provider `Authorization` header: AI Gateway injects the OpenAI key
+stored under its `default` alias. OpenAI bills your API project directly. Requests
+carry `cf-aig-no-wholesale: true` to prevent Unified Billing fallback; a missing or
+invalid stored key fails at the gateway/provider, without falling back to credits.
+No direct OpenAI URL, Workers AI endpoint, tools,
+web searches, background jobs, or hidden SDK retries are used.
+Defaults: `gpt-6.1-sol`, `reasoning.effort: high`, standard service tier,
 20 words/call, 25,000 output tokens (including reasoning), one in-flight request,
 10 RPM. The output cap follows OpenAI's initial reasoning-budget guidance and can
 be reduced after measuring real usage. Reasoning tokens are included in
 output usage and are **not double-counted**. Temperature/top-p are omitted.
 
-Change `ai.provider`, `ai.model`, and **all four `ai.pricesUsdPerMillion` values**
-together. A CLI model/provider override cannot reuse a different YAML model's
-price table; select a matching config file instead. Non-OpenAI defaults to the
-OpenAI-compatible chat API when `ai.api` is omitted; set it to `responses` if
-supported, or `chat` otherwise. Set `ai.reasoningEffort: omit` for a provider/model
-without that parameter. For Workers AI set `ai.provider: workers-ai` and the full
-`ai.model: "@cf/..."` slug.
+This integration supports **OpenAI only**; other providers are rejected rather
+than sent your OpenAI key. Keep `ai.provider: openai`. Change `ai.model` and **all
+four `ai.pricesUsdPerMillion` values** together. Model names must be native OpenAI
+names, without an `openai/` prefix. A CLI model override cannot reuse a different
+YAML model's price table; select a matching config file instead. `ai.api` defaults
+to `responses`; set it to `chat` for Chat Completions. Set `ai.reasoningEffort: omit`
+for a model without that parameter.
 Structured output support and normalized usage counters are required; unsupported
 models fail closed, never silently fall back to free-form text. Alternate models
-must report usage consistently with these compatible APIs. Native provider-only
-features and non-token billing aren't supported. Set actual gateway/provider rates
+must report usage consistently with these APIs. Native provider-only
+features and non-token billing aren't supported. Set your actual OpenAI rates
 including regional premiums; prices aren't inferred from a model name. Explicit
 cache-write usage reporting is required whenever its price differs from ordinary
-input. Providers without cache-write billing can set that price equal to input.
+input. Models without cache-write billing can set that price equal to input.
 
 Known cost is calculated with integer nano-USD from uncached input, cached input,
 cache writes (a replacement rate, **not** an additive fee), and total output.
@@ -185,7 +200,8 @@ estimate; it assumes provider framing fits that allowance and configured prices
 match actual billing. The client checks returned usage against the reservation.
 Keep gateway automatic retries/fallbacks disabled (also sent as
 `cf-aig-max-attempts: 1`) so billing isn't hidden from the ledger. Configure a
-gateway-side spending limit as defense in depth when using arbitrary providers.
+gateway-side spending limit as defense in depth. Review your OpenAI project budget
+and usage alerts too; the local ledger does not track requests made by other apps.
 
 429/408/5xx/network failures retry with exponential backoff, jitter, and
 `Retry-After`, subject to fresh budget reservations and persistent rolling RPM/TPM
@@ -224,7 +240,9 @@ The test suite uses native `bun:test`. Bun implements the retained `node:*`
 standard-library imports directly; no Node executable is required to run these
 scripts. The filesystem code deliberately retains `fsync` and atomic renames to
 preserve existing spending-ledger and checkpoint durability. The state format,
-cache keys, budget tracking, and development-only backend are unchanged.
+item cache keys, budget tracking, and development-only backend are unchanged.
+HTTP response cache digests now include the provider-native gateway URL; keep the
+existing ledger and item results when switching endpoints.
 
 Sources informing the request contract and prompts:
 
@@ -239,11 +257,14 @@ Sources informing the request contract and prompts:
   strict object schemas, required fields, refusal/incomplete handling.
 - [Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching):
   explicit reusable-prefix breakpoints, cache-write usage, replacement pricing.
-- [AI Gateway REST API](https://developers.cloudflare.com/ai-gateway/usage/rest-api/):
-  current unified endpoints, provider/model naming, token permissions, gateway header.
-- [OpenAI provider endpoint](https://developers.cloudflare.com/ai-gateway/usage/providers/openai/)
-  and [unified compatibility API](https://developers.cloudflare.com/ai-gateway/usage/chat-completion/):
-  researched alternatives; the latter is now deprecated for new single-model calls.
+- [OpenAI provider endpoint](https://developers.cloudflare.com/ai-gateway/usage/providers/openai/):
+  provider-native Responses/Chat Completions URLs.
+- [BYOK (Store Keys)](https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/):
+  dashboard provider-key storage, default aliases, and omitting provider authorization.
+- [Authenticated Gateway](https://developers.cloudflare.com/ai-gateway/configuration/authentication/):
+  AI Gateway Run permission and `cf-aig-authorization` for provider-native requests.
+- [Unified Billing credential precedence](https://developers.cloudflare.com/ai-gateway/features/unified-billing/#credential-precedence):
+  stored keys take precedence over credits; `cf-aig-no-wholesale` prevents fallback.
 - [Gateway request handling](https://developers.cloudflare.com/ai-gateway/configuration/request-handling/):
   explicit retry/timeout controls; client owns retries for budget visibility.
 
@@ -251,9 +272,12 @@ The test suite covers YAML configuration/validation, explicit-only environment
 loading, and the installed Convex client with mocked HTTP. Existing state files
 require no conversion.
 
-YAML migration verification: **28 tests passed on the installed Bun 1.4.0**;
+Stored-key BYOK verification: **30 tests passed on the installed Bun 1.4.0**;
 both CLI help commands passed. The project still pins Bun 1.4.2; that version
-was not installed or verified during this migration.
+was not installed or verified during this change. Tests cover gateway authentication,
+absence of provider authorization, provider-native routes, disabled billing
+fallback, and credential-free
+state/logs, including provider errors that echo credentials.
 
 Verification is offline/mocked. No paid model access, phonetic accuracy, live
 gateway usage normalization, deployment, or bulk database writes were exercised.
