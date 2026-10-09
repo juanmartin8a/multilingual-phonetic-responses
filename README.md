@@ -13,15 +13,12 @@ If you installed Bun directly, `bun upgrade` updates it to the latest stable
 release; if managed by Homebrew or a version manager, update it through that tool.
 Check `bun --version` before running. No `bun install` is needed here.
 
-1. In SAPO's **development** Convex dashboard, set
-   `SAPO_PHONETICS_DEVELOPMENT_URL` to the exact `EXPO_PUBLIC_CONVEX_URL` from
-   SAPO's `.env.local`. **Do not set this variable in production.**
-2. Publish the new `convex/phoneticPopulation.ts` and
+1. Publish the new `convex/phoneticPopulation.ts` and
    `convex/model/phoneticPopulation.ts` to development using the project's normal
    `npm run convex:dev` workflow. This also regenerates Convex types. These files
-   are in SAPO's backend git submodule. They have **not** been deployed by this task.
+   are in SAPO's backend git submodule.
    Preserve/deploy the existing pronunciation schema and helpers they import.
-3. Copy `.env.example` to `.env` here and fill in credentials. The Convex key must
+2. Copy `.env.example` to `.env.local` here and fill in credentials. The Convex key must
    be a `dev:<name>|...` deployment key for SAPO's `.env.local` deployment.
    In Cloudflare **AI > AI Gateway**, create/select your gateway, then go to
    **Provider Keys > Add API Key**. Select **OpenAI**, enter your OpenAI project
@@ -32,14 +29,15 @@ Check `bun --version` before running. No `bun install` is needed here.
    scoped to your account (not Workers AI Read). Enable **Authenticated Gateway**
    and **Require provider credentials** in the gateway settings. No Cloudflare
    Unified Billing credits are required, and no OpenAI key is needed locally.
-4. Edit `config/transcriptions.yml` or `config/respellings.yml` for the script
+3. Edit `config/transcriptions.yml` or `config/respellings.yml` for the script
    you want to run. Uncomment `cloudflare` and enter your account and gateway
    IDs in that file before generating. Keep API tokens and deployment
-   keys out of YAML; only `.env` or shell variables supply credentials.
+   keys out of YAML; only `.env.local` or shell variables supply credentials.
 
 Neither script accepts a database URL or a production switch. Both require the
-development name/URL in `.env.local`, a matching **dev** key, and the backend's
-explicit opt-in matching `CONVEX_CLOUD_URL`. The production environment file is
+development name/URL in SAPO's `.env.local` and a matching **dev** key. The
+backend checks the requested URL against Convex's built-in `CONVEX_CLOUD_URL`;
+no custom backend URL variable is needed. The production environment file is
 also checked for a conflicting target. Production/project/preview/legacy keys,
 local deployments, redirects, and mismatched URLs are rejected.
 
@@ -49,16 +47,16 @@ From `~/development/js/sapo-mpr`:
 
 ```sh
 # First-page read-only plans. No model call; no database mutation.
-bun --env-file=.env populate-transcriptions.mjs
-bun --env-file=.env populate-respellings.mjs
+bun --env-file=.env.local populate-transcriptions.mjs
+bun --env-file=.env.local populate-respellings.mjs
 
 # Optional: paid generation saved LOCALLY, without database writes.
-bun --env-file=.env populate-transcriptions.mjs --generate --budget 1 --max-pages 1
-bun --env-file=.env populate-respellings.mjs --generate --budget 1 --max-pages 1
+bun --env-file=.env.local populate-transcriptions.mjs --generate --budget 1 --max-pages 1
+bun --env-file=.env.local populate-respellings.mjs --generate --budget 1 --max-pages 1
 
 # Paid generation plus INSERT-ONLY development writes, within the shared budget.
-bun --env-file=.env populate-transcriptions.mjs --generate --write --budget 5
-bun --env-file=.env populate-respellings.mjs --generate --write --budget 5
+bun --env-file=.env.local populate-transcriptions.mjs --generate --write --budget 5
+bun --env-file=.env.local populate-respellings.mjs --generate --write --budget 5
 
 # Offline tests: mocked database and AI only.
 bun test
@@ -83,7 +81,7 @@ files are not merged. YAML is parsed by Bun's built-in parser, so no package
 installation is needed.
 
 Precedence is **CLI options > YAML settings > safe built-in defaults**. Environment
-variables supply only `SAPO_CONVEX_DEV_KEY` and `CLOUDFLARE_API_TOKEN`; the old
+variables supply only `CONVEX_KEY` and `CLOUDFLARE_API_TOKEN`; the old
 `AI_*`, `SAPO_MAX_USD`, account/gateway, and language-policy environment settings
 are no longer read. Move any existing values into the corresponding YAML sections.
 `--generate` and `--write` remain explicit CLI permissions, never YAML settings.
@@ -104,7 +102,7 @@ ledger and lock unless you explicitly select different state directories.
 in the respelling config it controls source pronunciation and target scripts.
 
 ```sh
-bun --env-file=.env populate-transcriptions.mjs --config ./config/transcriptions.yml --generate --budget 1
+bun --env-file=.env.local populate-transcriptions.mjs --config ./config/transcriptions.yml --generate --budget 1
 ```
 
 Both `config/*.yml` files can be committed because they contain no credentials. All `.env*`
@@ -141,6 +139,9 @@ directory selects a new pair but also has a **separate** spending ledger.
   respellings can be reviewed before insertion. Existing guides are preserved.
 - Both tasks use strict JSON Schema and local validation of exact keys, counts,
   status/value consistency, bounded strings, IPA shape, and target scripts.
+  Each request restricts output keys to an enum of its input keys to prevent
+  mistyped IDs. Duplicate keys still fail local validation; rejection messages
+  identify the offending record and saved response file.
   Database IDs/codes come from Convex, never from the model. The backend rechecks
   linked documents and performs indexed existence checks and inserts atomically.
   Parallel/repeated mutations cannot create duplicates through these endpoints.
@@ -219,7 +220,12 @@ limits. **Unknown billing is never treated as zero**: crashes/timeouts/rejection
 without usage retain the full reservation. Saved responses are settled/reused on
 restart; incomplete/refused/invalid outputs are charged but never written or
 automatically regenerated. Valid item caches avoid repeat generation even if
-batch size changes. Gateway response caching is skipped to avoid replaying usage
+batch size changes. Requests with the input-key enum have a different response
+cache key from older unconstrained requests. After upgrading, resume with the
+same command: valid item results are reused, and an older rejected batch gets a
+new constrained request under the existing cumulative budget. Keep all state
+files; the rejected request's charge remains in the ledger.
+Gateway response caching is skipped to avoid replaying usage
 as a new bill; GPT-6 explicit prefix caching avoids cache writes for changing word
 batches. Prompts stay concise; they are not padded just to reach caching thresholds.
 
@@ -236,7 +242,7 @@ State/credentials are ignored by Git and created with restrictive permissions.
 Do not delete/share state casually: it contains source words, outputs, and usage.
 No secret key is written to state or passed as a CLI argument. Cloudflare gateway
 logging/retention remains your account's setting; prompts go to the selected AI
-provider through Cloudflare. The backend module must stay disabled in production.
+provider through Cloudflare. Use these scripts only with the verified development deployment.
 
 ## Architecture and research (2026-10-08)
 

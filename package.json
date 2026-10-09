@@ -7,8 +7,8 @@
     "bun": ">=1.4.2"
   },
   "scripts": {
-    "transcriptions": "bun --env-file=.env ./populate-transcriptions.mjs",
-    "respellings": "bun --env-file=.env ./populate-respellings.mjs",
+    "transcriptions": "bun --env-file=.env.local ./populate-transcriptions.mjs",
+    "respellings": "bun --env-file=.env.local ./populate-respellings.mjs",
     "test": "bun test"
   }
 }

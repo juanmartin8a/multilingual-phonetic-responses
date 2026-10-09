@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, readdirSy
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { configuration, developmentIdentity, usd } from '../lib/config.mjs';
-import { atomicJson, readJson, journal, lockState } from '../lib/files.mjs';
+import { atomicJson, readJson, journal, lockState, digest } from '../lib/files.mjs';
 import { validIpa, validRespelling, validateRecords, choosePair, languagePolicy } from '../lib/data.mjs';
 import { createAI, usageCost, requestBody, reservation, ledgerTotals, outputText, retryDelay } from '../lib/ai.mjs';
 import { populate } from '../lib/run.mjs';
@@ -123,6 +123,9 @@ test('production, project, preview, legacy and wrong-development keys fail close
   for (const key of ['prod:test-dev|secret', 'project:foo|secret', 'preview:foo|secret', 'secret', 'dev:wrong|secret', 'dev:test-dev|']) {
     assert.throws(() => developmentIdentity('/project', key, read));
   }
+  for (const key of [undefined, '', ' ']) {
+    assert.throws(() => developmentIdentity('/project', key, read), /is missing; load credentials/);
+  }
   assert.equal(developmentIdentity('/project', 'dev:test-dev|secret', read).url, identity.url);
   assert.throws(() => developmentIdentity('/project', 'dev:test-dev|secret', () =>
     'CONVEX_DEPLOYMENT=prod:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud'));
@@ -151,7 +154,7 @@ test('configuration is safe by default and custom models require explicit prices
 
 test('YAML settings, CLI overrides, and credential-only environment variables', () => {
   const cfg = configured(['--budget', '0.123456789', '--batch-size', '5', '--max-pages', '2'], {
-    SAPO_CONVEX_DEV_KEY: 'dev:test-dev|fake', CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: 'fake-openai-key',
+    CONVEX_KEY: 'dev:test-dev|fake', CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: 'fake-openai-key',
     AI_PROVIDER: 'ignored', AI_MODEL: 'ignored', AI_API: 'ignored', AI_REASONING_EFFORT: 'none',
     AI_INPUT_USD_PER_M: '999', SAPO_MAX_USD: '999', AI_MAX_OUTPUT_TOKENS: '1',
     AI_REQUESTS_PER_MINUTE: '999', AI_TOKENS_PER_MINUTE: '1', AI_MAX_ATTEMPTS: '999', AI_TIMEOUT_MS: '1',
@@ -542,6 +545,67 @@ test('the same ledger cap applies to IPA and respelling tasks', async () => {
   await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
   await assert.rejects(ai.generate('respell', [{ key: '2', word: 'hello', ipa: '/həˈloʊ/' }], source, target), /Budget exhausted/);
   assert.equal(count.calls, 1);
+});
+
+test('both API formats constrain IPA and respelling keys without changing the shared schema', () => {
+  for (const api of ['responses', 'chat']) {
+    const cfg = fixture({ api });
+    for (const task of ['ipa', 'respell']) {
+      const words = [{ key: 'opaque-id-1', word: 'hello' }, { key: 'opaque-id-2', word: 'hello' }];
+      const body = requestBody(cfg, task, { source, ...(task === 'respell' ? { target } : {}), words });
+      const schema = api === 'responses' ? body.text.format.schema : body.response_format.json_schema.schema;
+      assert.deepEqual(schema.properties.records.items.properties.key.enum, words.map((word) => word.key));
+      const next = requestBody(cfg, task, { source, words: [{ key: 'other-id', word: 'other' }] });
+      const nextSchema = api === 'responses' ? next.text.format.schema : next.response_format.json_schema.schema;
+      assert.deepEqual(nextSchema.properties.records.items.properties.key.enum, ['other-id']);
+      assert.deepEqual(schema.properties.records.items.properties.key.enum, ['opaque-id-1', 'opaque-id-2']);
+    }
+  }
+});
+
+test('both generation tasks reject mistyped and duplicate keys with diagnostics, retaining billing', async () => {
+  for (const task of ['ipa', 'respell']) {
+    for (const failure of ['unknown', 'duplicate', 'malformed']) {
+      const cfg = fixture();
+      const count = { calls: 0 };
+      const jobs = [{ key: 'id-1', word: 'hello', ipa: '/a/' }, { key: 'id-2', word: 'hi', ipa: '/b/' }];
+      const fetchFn = fakeFetch(count, (rows) => {
+        if (failure === 'unknown') rows[1].key = 'id-2-typo';
+        if (failure === 'duplicate') rows[1].key = rows[0].key;
+        if (failure === 'malformed') rows[1].extra = true;
+        return answer(rows);
+      });
+      const ai = createAI(cfg, { fetchFn, log: () => {} });
+      const rejection = new RegExp(`${task} batch rejected: ${failure === 'unknown' ? 'Unknown key' : failure === 'duplicate' ? 'Duplicate key' : 'Malformed record'} at index 1.*saved response:`);
+      await assert.rejects(ai.generate(task, jobs, source, task === 'respell' ? target : null), rejection);
+      assert.equal(ai.totals().known, 7150000);
+      assert.equal(readdirSync(join(cfg.stateDir, 'responses')).length, 1);
+      assert.equal(readJson(join(cfg.stateDir, 'results')), undefined);
+      const resumed = createAI(cfg, { fetchFn, log: () => {} });
+      await assert.rejects(resumed.generate(task, jobs, source, task === 'respell' ? target : null), rejection);
+      assert.equal(count.calls, 1, 'Rejected responses remain charged and cached after restart');
+      assert.equal(resumed.totals().known, 7150000);
+    }
+  }
+});
+
+test('constrained requests bypass legacy bad responses while reusing valid item results', async () => {
+  const cfg = fixture();
+  const count = { calls: 0 };
+  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
+  const jobs = [{ key: 'id-1', word: 'hello' }, { key: 'id-2', word: 'hi' }];
+  await ai.generate('ipa', [jobs[0]], source);
+  const prompt = readFileSync(new URL('../prompts/ipa.md', import.meta.url), 'utf8');
+  const legacyBody = requestBody(cfg, prompt, { source, words: [jobs[1]] });
+  delete legacyBody.text.format.schema.properties.records.items.properties.key.enum;
+  const url = `https://gateway.ai.cloudflare.com/v1/${cfg.account}/${cfg.gateway}/openai/responses`;
+  const legacyPath = join(cfg.stateDir, 'responses', `${digest([url, legacyBody])}.json`);
+  atomicJson(legacyPath, answer([row('id-2-typo')]));
+  const results = await ai.generate('ipa', jobs, source);
+  assert.deepEqual([...results.keys()], ['id-1', 'id-2']);
+  assert.equal(count.calls, 2, 'Only the uncached item needs a new constrained request');
+  assert.equal(JSON.parse(outputText(readJson(legacyPath), cfg.api)).records[0].key, 'id-2-typo');
+  assert.equal(ai.totals().known, 14300000);
 });
 
 test('missing usage and malformed model output stop before result caching', async () => {
