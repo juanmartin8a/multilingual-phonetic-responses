@@ -1,299 +1,157 @@
 # SAPO development phonetic population
 
-Two standalone **Bun 1.4.2+** scripts (latest stable verified on 2026-10-08;
-no installation/build needed). They use
-SAPO's existing `convex` dependency; install SAPO's dependencies if absent.
-JavaScript fits the TypeScript/Convex backend and avoids a second database SDK.
-Python's existing `words_to_convex` tool creates word lists, not pronunciations.
+Two standalone Bun scripts generate missing IPA transcriptions and native-script
+respellings for SAPO's development database. Generation is always enabled.
+By default, finalized results are saved locally. With `--write`, each finalized
+batch is inserted into the database and no local files are created or updated.
 
 ## Setup
 
-Use Bun **1.4.2**, the version recorded in `.bun-version` and `packageManager`.
-If you installed Bun directly, `bun upgrade` updates it to the latest stable
-release; if managed by Homebrew or a version manager, update it through that tool.
-Check `bun --version` before running. No `bun install` is needed here.
+The project pins Bun 1.4.2 in `.bun-version` and `packageManager`. These scripts
+use SAPO's existing `convex` dependency; install SAPO's dependencies if absent.
+There are no additional package dependencies here.
 
-1. Publish the new `convex/phoneticPopulation.ts` and
-   `convex/model/phoneticPopulation.ts` to development using the project's normal
-   `npm run convex:dev` workflow. This also regenerates Convex types. These files
-   are in SAPO's backend git submodule.
-   Preserve/deploy the existing pronunciation schema and helpers they import.
-2. Copy `.env.example` to `.env.local` here and fill in credentials. The Convex key must
-   be a `dev:<name>|...` deployment key for SAPO's `.env.local` deployment.
-   In Cloudflare **AI > AI Gateway**, create/select your gateway, then go to
-   **Provider Keys > Add API Key**. Select **OpenAI**, enter your OpenAI project
-   key, and save it with alias **default**. Verify your OpenAI project has API
-   billing enabled and access to `gpt-6.1-sol`. Open the gateway's
-   **Settings > Create authentication token**, and save the
-   token as `CLOUDFLARE_API_TOKEN`. The token needs **Account > AI Gateway > Run**,
-   scoped to your account (not Workers AI Read). Enable **Authenticated Gateway**
-   and **Require provider credentials** in the gateway settings. No Cloudflare
-   Unified Billing credits are required, and no OpenAI key is needed locally.
-3. Edit `config/transcriptions.yml` or `config/respellings.yml` for the script
-   you want to run. Uncomment `cloudflare` and enter your account and gateway
-   IDs in that file before generating. Keep API tokens and deployment
-   keys out of YAML; only `.env.local` or shell variables supply credentials.
+1. Deploy SAPO's `convex/phoneticPopulation.ts` and
+   `convex/model/phoneticPopulation.ts` through its normal development workflow.
+2. Copy `.env.example` to `.env.local` here and fill in `CONVEX_KEY` and
+   `CLOUDFLARE_API_TOKEN`. The Convex key must match the hosted `dev:` deployment
+   in SAPO's `.env.local`.
+3. Configure AI Gateway with an OpenAI provider key under alias `default`,
+   authenticated gateway access, and an API token with AI Gateway Run permission.
+   No local `OPENAI_API_KEY` is used.
+4. Set `cloudflare.accountId` and `cloudflare.gatewayId` in each script's YAML
+   configuration. Keep credentials in the environment, outside YAML.
 
-Neither script accepts a database URL or a production switch. Both require the
-development name/URL in SAPO's `.env.local` and a matching **dev** key. The
-backend checks the requested URL against Convex's built-in `CONVEX_CLOUD_URL`;
-no custom backend URL variable is needed. The production environment file is
-also checked for a conflicting target. Production/project/preview/legacy keys,
-local deployments, redirects, and mismatched URLs are rejected.
+Both scripts verify SAPO's development deployment name and URL, require a matching
+development key, check for conflicts with production configuration, and reject
+redirects. Neither accepts an arbitrary database URL or production flag.
 
 ## Run
 
-From `~/development/js/sapo-mpr`:
-
 ```sh
-# First-page read-only plans. No model call; no database mutation.
-bun --env-file=.env.local populate-transcriptions.mjs
-bun --env-file=.env.local populate-respellings.mjs
+# Generate and save finalized results locally.
+bun run transcriptions
+bun run respellings
 
-# Optional: paid generation saved LOCALLY, without database writes.
-bun --env-file=.env.local populate-transcriptions.mjs --generate --budget 1 --max-pages 1
-bun --env-file=.env.local populate-respellings.mjs --generate --budget 1 --max-pages 1
+# Generate and insert each finalized batch; no local writes.
+bun run transcriptions --write
+bun run respellings --write
 
-# Paid generation plus INSERT-ONLY development writes, within the shared budget.
-bun --env-file=.env.local populate-transcriptions.mjs --generate --write --budget 5
-bun --env-file=.env.local populate-respellings.mjs --generate --write --budget 5
+# Override the allowance for this invocation or limit scanned pages.
+bun run transcriptions --budget 1 --max-pages 1
+bun run respellings --write --budget 5
 
-# Offline tests: mocked database and AI only.
+# Offline tests with mocked AI and database calls.
 bun test
 ```
 
-`bun run transcriptions` and `bun run respellings` are equivalent shortcuts;
-append the same script flags. `bunfig.toml` disables Bun's automatic environment
-file loading, so only explicitly selected `--env-file` files and shell variables
-are used. Keep secret values containing `$` escaped as `\$` in Bun environment
-files to prevent variable expansion. SAPO's deployment environment files are
-parsed read-only and never loaded into the script's environment.
+The package shortcuts explicitly load this checkout's `.env.local`. Direct
+invocation is equivalent: `bun --env-file=.env.local populate-transcriptions.mjs`.
+`bunfig.toml` disables automatic environment-file loading. SAPO's environment
+files are only read to verify the development target.
 
-### Configuration
+There is no `--generate` or `--rescan` flag. Every invocation scans from the start,
+reusing matching local results or skipping values already present in the database.
+Both scripts scan all pages by default; `--max-pages N` limits scan pages, each
+containing at most 50 words. It does not count the refresh queries used to resolve
+new IPA IDs. `--help` displays the available flags without generating anything.
 
-`populate-transcriptions.mjs` defaults to `config/transcriptions.yml`;
-`populate-respellings.mjs` defaults to `config/respellings.yml`. Each file contains
-only settings for its script, so changing one does not change the other. Both
-scripts share parsing and validation code, but never load each other's settings.
-Default config paths are independent of the shell's working directory. Use
-`--config path/to/settings.yml` to replace the selected script's config explicitly;
-files are not merged. YAML is parsed by Bun's built-in parser, so no package
-installation is needed.
+## Configuration
 
-Precedence is **CLI options > YAML settings > safe built-in defaults**. Environment
-variables supply only `CONVEX_KEY` and `CLOUDFLARE_API_TOKEN`; the old
-`AI_*`, `SAPO_MAX_USD`, account/gateway, and language-policy environment settings
-are no longer read. Move any existing values into the corresponding YAML sections.
-`--generate` and `--write` remain explicit CLI permissions, never YAML settings.
-`OPENAI_API_KEY` is not read; store your provider key in the gateway dashboard,
-not in local environment files. The gateway uses the OpenAI key's `default` alias.
+`populate-transcriptions.mjs` uses `config/transcriptions.yml`;
+`populate-respellings.mjs` uses `config/respellings.yml`. Each loads only its own
+file. Use `--config PATH` to select a replacement.
 
-The file groups model/output settings under `ai`, spending/rate/retry settings
-under `limits`, and account identifiers under `cloudflare`. `project`, `stateDir`,
-`batchSize`, `maxPages`, and `languagePolicies` are top-level settings. Unknown
-fields and invalid types/values are rejected. Quote monetary values to preserve
-exact decimals; integer limits use YAML numbers. Paths in YAML are relative to
-the selected config file (`~/` is supported); CLI paths are relative to the shell.
-For these files in `config/`, `stateDir: ../.state` refers to the existing shared
-ledger. Omitting `stateDir` also keeps the shared `<script-dir>/.state` ledger.
-Configuration independence does not split spending: both scripts retain that
-ledger and lock unless you explicitly select different state directories.
-`languagePolicies` in the transcription config controls source pronunciation;
-in the respelling config it controls source pronunciation and target scripts.
+CLI options override YAML settings. Environment variables supply only credentials.
+YAML paths are relative to the selected file; CLI paths are relative to the shell.
+`~/` is supported in YAML paths. Default config and state paths are relative to
+these scripts, independent of the working directory.
 
-```sh
-bun --env-file=.env.local populate-transcriptions.mjs --config ./config/transcriptions.yml --generate --budget 1
-```
+- `project`: SAPO checkout, default `~/development/react-native/sapo`.
+- `stateDir`: local results directory, default `<script-dir>/.state`.
+- `batchSize`: 1–1000 words per AI request, default 20. Larger batches group
+  database pages. Long inputs/review notes are split to fit request/token limits.
+- `maxPages`: scan-page limit; 0 means all pages.
+- `ai`: provider, model, API, reasoning effort, output cap, and token prices.
+- `limits`: positive per-run USD allowance, RPM/TPM, attempts, and timeout.
+- `cloudflare`: account and gateway identifiers.
+- `languagePolicies`: source dialect and target Unicode-script overrides.
 
-Both `config/*.yml` files can be committed because they contain no credentials. All `.env*`
-files except `.env.example` are ignored by Git. The SAPO checkout's deployment
-environment files still serve only as read-only development-target safety checks.
+Unknown settings and invalid types are rejected. Quote monetary values for exact
+arithmetic. The integration supports OpenAI provider-native Responses and Chat
+Completions endpoints through AI Gateway. Change the model and all four token
+prices together; alternate models require explicit prices and structured-output
+support. Models without a reasoning parameter can use `reasoningEffort: omit`.
 
-The default state directory is beside these scripts, independent of the shell's
-working directory. The budget is the **cumulative cap for that shared `.state`
-directory**, not a new
-allowance for every command. `$5` means five dollars total across both scripts,
-all retries, and resumes. Raise the cap deliberately to continue. Keep the same
-state directory; creating another directory creates another independent budget.
-Run `--help` for flags. Generation/write scans all pages by default; planning
-reads one page unless `--max-pages 0` is specified. `--max-pages` counts pages,
-not words; each page has at most 50 words and may have multiple IPA variants.
+## Local storage and write mode
 
-Resume by repeating the command. Generation-only and write checkpoints are
-separate, so applying locally generated results scans from the beginning and
-reuses item caches. `--rescan` starts that stage again while retaining results,
-spending, and the selected pair; use it for newly added words/languages or after
-manual review. The source is chosen randomly among languages containing words;
-the target is selected independently from all other distinct languages. The pair
-is saved even during planning and retained on every resume/rescan. A new state
-directory selects a new pair but also has a **separate** spending ledger.
+Default mode stores only:
 
-## Data and quality
+| Path | Contents |
+| --- | --- |
+| `results/<hash>.json` | Task, word/entry identity, source language, final value, and generation signature. Respelling results also contain the target language and exact source IPA. |
+| `respelling-pair.json` | Source and target language codes for subsequent respelling runs. |
 
-- Transcriptions scan every existing language/word but generate only where no
-  transcription exists. They add one common standard broad IPA pronunciation;
-  existing records and variants are never updated/deleted.
-- Respellings use every existing source IPA variant missing its target guide.
-  They first generate missing IPA, including in generation-only mode, then use
-  that exact IPA to produce a native-script approximation. Generated IPA and
-  respellings can be reviewed before insertion. Existing guides are preserved.
-- Both tasks use strict JSON Schema and local validation of exact keys, counts,
-  status/value consistency, bounded strings, IPA shape, and target scripts.
-  Each request restricts output keys to an enum of its input keys to prevent
-  mistyped IDs. Duplicate keys still fail local validation; rejection messages
-  identify the offending record and saved response file.
-  Database IDs/codes come from Convex, never from the model. The backend rechecks
-  linked documents and performs indexed existence checks and inserts atomically.
-  Parallel/repeated mutations cannot create duplicates through these endpoints.
-- `results/*.json` contains the result **and its word, language policy, and IPA
-  context**. `status: review` records are never inserted. They remain in local
-  caches; rescanning alone does not retry them. A linguist can correct a reviewed
-  result (`ready`, valid `value`, empty `note`) before rescanning. Otherwise fix
-  the source data/policy and regenerate under the same cumulative budget.
-- Standard policies match SAPO where defined: neutral Latin American Spanish,
-  Brazilian Portuguese, Beijing Mandarin/Simplified Chinese, etc. All other
-  source languages use their most widely understood standard variety. Override
-   dialect/script via `languagePolicies` in YAML. Japanese uses kana/kanji,
-  Mandarin uses Han characters, Arabic permits vowel marks. An unsupported
-  randomly selected target script stops with a policy-configuration error.
+Only valid, finalized results are saved. Review notes, first-pass decisions, raw
+provider responses, failed attempts, rejections, usage history, checkpoints, and
+locks are not stored. Cache files are written atomically with private permissions.
+The default `.state/` directory and credential files are ignored by Git.
 
-Structural validation cannot prove phonetic correctness, detect all heteronyms,
-or verify Simplified vs Traditional Chinese. Missing sense/context/dialect data
-limits certainty. Review representative samples with native speakers before any
-large run. Ambiguous/unreliable words are intentionally left missing for review,
-so a completed scan does **not** imply every word was safely transcribable.
+The cache signature covers prompts, schemas, language policies, model, reasoning
+effort, and API. The filename also identifies the deployment and exact job. Batch
+size changes reuse compatible results; incompatible settings generate new ones.
 
-## Gateway, usage, and costs
+`--write` can read matching results and a language pair from an existing local
+cache, so generating locally first and inserting later does not require paying
+again for those results. It creates or updates no local state. Without a saved
+pair, a write run chooses its source and target in memory.
 
-All inference goes through AI Gateway's OpenAI provider-native endpoints:
-`https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/openai/responses`
-or `/openai/chat/completions`. Only
-`cf-aig-authorization: Bearer <CLOUDFLARE_API_TOKEN>` is sent for authentication.
-There is no provider `Authorization` header: AI Gateway injects the OpenAI key
-stored under its `default` alias. OpenAI bills your API project directly. Requests
-carry `cf-aig-no-wholesale: true` to prevent Unified Billing fallback; a missing or
-invalid stored key fails at the gateway/provider, without falling back to credits.
-No direct OpenAI URL, Workers AI endpoint, tools,
-web searches, background jobs, or hidden SDK retries are used.
-Defaults: `gpt-6.1-sol`, `reasoning.effort: high`, standard service tier,
-20 words/call, 25,000 output tokens (including reasoning), one in-flight request,
-10 RPM. The output cap follows OpenAI's initial reasoning-budget guidance and can
-be reduced after measuring real usage. Reasoning tokens are included in
-output usage and are **not double-counted**. Temperature/top-p are omitted.
+After each AI batch, required reviews finish before finalized values are inserted.
+Database mutations contain at most 50 records. An insertion failure stops further
+AI generation; previous inserted batches remain in the database. Any uninserted
+in-memory results are lost when the process exits and may need generating again.
+Repeating the command discovers progress by scanning existing database values and
+local results. There is no separate cache-only insertion mode.
 
-This integration supports **OpenAI only**; other providers are rejected rather
-than sent your OpenAI key. Keep `ai.provider: openai`. Change `ai.model` and **all
-four `ai.pricesUsdPerMillion` values** together. Model names must be native OpenAI
-names, without an `openai/` prefix. A CLI model override cannot reuse a different
-YAML model's price table; select a matching config file instead. `ai.api` defaults
-to `responses`; set it to `chat` for Chat Completions. Set `ai.reasoningEffort: omit`
-for a model without that parameter.
-Structured output support and normalized usage counters are required; unsupported
-models fail closed, never silently fall back to free-form text. Alternate models
-must report usage consistently with these APIs. Native provider-only
-features and non-token billing aren't supported. Set your actual OpenAI rates
-including regional premiums; prices aren't inferred from a model name. Explicit
-cache-write usage reporting is required whenever its price differs from ordinary
-input. Models without cache-write billing can set that price equal to input.
+## Data and review
 
-Known cost is calculated with integer nano-USD from uncached input, cached input,
-cache writes (a replacement rate, **not** an additive fee), and total output.
-Usage and cost persist in `usage.jsonl`; each request has its prices and model.
-The final summary separates known cost from uncertain reservations. Provider
-invoices remain authoritative. Missing/inconsistent usage, an unexpected service
-tier, or an unexpectedly large context stops execution before writing that batch.
+Transcriptions scan populated languages and generate only for words without IPA.
+Existing transcriptions and pronunciation variants are preserved.
 
-Before each attempt, reserve output-token cap cost plus a conservative input
-bound: full request UTF-8 bytes plus 8,192 framing tokens, at the highest input
-rate. Requests over 64K reserved input tokens are rejected, below GPT-6.1 Sol's
-long-context pricing threshold. This is deliberately conservative, not a tokenizer
-estimate; it assumes provider framing fits that allowance and configured prices
-match actual billing. The client checks returned usage against the reservation.
-Keep gateway automatic retries/fallbacks disabled (also sent as
-`cf-aig-max-attempts: 1`) so billing isn't hidden from the ledger. Configure a
-gateway-side spending limit as defense in depth. Review your OpenAI project budget
-and usage alerts too; the local ledger does not track requests made by other apps.
+Respellings choose a populated source and a distinct target language. They process
+every source IPA variant missing its target guide. Missing IPA is generated first;
+write mode inserts it and reloads real database IDs before linking respellings.
+Local mode uses the generated IPA directly, without requiring a database ID.
 
-429/408/5xx/network failures retry with exponential backoff, jitter, and
-`Retry-After`, subject to fresh budget reservations and persistent rolling RPM/TPM
-limits. **Unknown billing is never treated as zero**: crashes/timeouts/rejections
-without usage retain the full reservation. Saved responses are settled/reused on
-restart; incomplete/refused/invalid outputs are charged but never written or
-automatically regenerated. Valid item caches avoid repeat generation even if
-batch size changes. Requests with the input-key enum have a different response
-cache key from older unconstrained requests. After upgrading, resume with the
-same command: valid item results are reused, and an older rejected batch gets a
-new constrained request under the existing cumulative budget. Keep all state
-files; the rejected request's charge remains in the ledger.
-Gateway response caching is skipped to avoid replaying usage
-as a new bill; GPT-6 explicit prefix caching avoids cache writes for changing word
-batches. Prompts stay concise; they are not padded just to reach caching thresholds.
+Requests contain ordered words with positional indexes; database IDs stay local.
+Returned indexes and words must match exactly. Values are validated for IPA shape
+or target script. Invalid individual records are skipped and reported in the
+terminal; rerunning retries them naturally because they were not saved/inserted.
+Invalid JSON, refusals, incomplete responses, and billing errors stop the batch.
 
-## Recovery and privacy
+Valid first-pass items marked for review receive a separate final-editor request
+using the same model. Only flagged words, their review notes, and authoritative IPA
+where applicable are sent. Every reviewed item must return a valid definitive
+value. A failed review prevents the batch from being saved or inserted.
 
-Only one process may use a state directory. On an abnormal crash, inspect
-`.state/population.lock`, ensure its PID is no longer running, then remove **only
-that lock file**. Keep the ledger and caches. An incomplete final journal event
-stops execution; recover it against saved request artifacts/gateway logs instead
-of deleting it to gain budget. Unknown charges remain conservatively reserved.
-No automatic stale-lock removal or unknown-cost refunds occur.
+Structural validation cannot prove pronunciation accuracy or resolve every
+context-dependent reading. Language policies guide the model's choice.
 
-State/credentials are ignored by Git and created with restrictive permissions.
-Do not delete/share state casually: it contains source words, outputs, and usage.
-No secret key is written to state or passed as a CLI argument. Cloudflare gateway
-logging/retention remains your account's setting; prompts go to the selected AI
-provider through Cloudflare. Use these scripts only with the verified development deployment.
+## Budget and rate limits
 
-## Architecture and research (2026-10-08)
+Every invocation starts with a fresh budget. Before starting a new paid batch,
+the script checks spending committed during that invocation. A batch admitted
+below the threshold finishes retries and required reviews even if they exceed
+it. The allowance is a stop threshold, not a hard spending cap.
 
-Two small entrypoints share data-oriented modules for plain configuration,
-validation, HTTP calls, and disk files. No AI SDK, ORM, schema library, queue,
-or new package dependency. Indexed, paginated backend reads avoid full-table
-downloads; bounded batch mutations reuse SAPO's relationship-aware helpers.
-Atomic JSON checkpoints/item caches and a fsynced append-only reservation ledger
-provide recovery without introducing a separate database.
-The test suite uses native `bun:test`. Bun implements the retained `node:*`
-standard-library imports directly; no Node executable is required to run these
-scripts. The filesystem code deliberately retains `fsync` and atomic renames to
-preserve existing spending-ledger and checkpoint durability. The state format,
-item cache keys, budget tracking, and development-only backend are unchanged.
-HTTP response cache digests now include the provider-native gateway URL; keep the
-existing ledger and item results when switching endpoints.
+Costs use integer nano-USD and account for uncached input, cached input, cache
+writes, and total output, including reasoning. Each attempt temporarily reserves
+a conservative input/output cost in memory. Returned usage settles it to known
+cost; missing usage or transport failures retain the reservation for that run.
+The final terminal summary reports known cost, uncertain cost, and token usage.
+Nothing is written to a usage ledger.
 
-Sources informing the request contract and prompts:
-
-- [GPT-6 guidance](https://developers.openai.com/api/docs/guides/latest-model):
-  supported reasoning, concise task boundaries, no unsupported sampling settings.
-- [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol): high
-  effort, Structured Outputs, standard prices ($2 input, $0.10 cached input,
-  $2.50 cache writes, $10 output per million tokens).
-- [Reasoning guidance](https://developers.openai.com/api/docs/guides/reasoning):
-  simple direct prompts, no requested chain of thought, and initial output headroom.
-- [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs):
-  strict object schemas, required fields, refusal/incomplete handling.
-- [Prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching):
-  explicit reusable-prefix breakpoints, cache-write usage, replacement pricing.
-- [OpenAI provider endpoint](https://developers.cloudflare.com/ai-gateway/usage/providers/openai/):
-  provider-native Responses/Chat Completions URLs.
-- [BYOK (Store Keys)](https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/):
-  dashboard provider-key storage, default aliases, and omitting provider authorization.
-- [Authenticated Gateway](https://developers.cloudflare.com/ai-gateway/configuration/authentication/):
-  AI Gateway Run permission and `cf-aig-authorization` for provider-native requests.
-- [Unified Billing credential precedence](https://developers.cloudflare.com/ai-gateway/features/unified-billing/#credential-precedence):
-  stored keys take precedence over credits; `cf-aig-no-wholesale` prevents fallback.
-- [Gateway request handling](https://developers.cloudflare.com/ai-gateway/configuration/request-handling/):
-  explicit retry/timeout controls; client owns retries for budget visibility.
-
-The test suite covers YAML configuration/validation, explicit-only environment
-loading, and the installed Convex client with mocked HTTP. Existing state files
-require no conversion.
-
-Stored-key BYOK verification: **30 tests passed on the installed Bun 1.4.0**;
-both CLI help commands passed. The project still pins Bun 1.4.2; that version
-was not installed or verified during this change. Tests cover gateway authentication,
-absence of provider authorization, provider-native routes, disabled billing
-fallback, and credential-free
-state/logs, including provider errors that echo credentials.
-
-Verification is offline/mocked. No paid model access, phonetic accuracy, live
-gateway usage normalization, deployment, or bulk database writes were exercised.
+RPM/TPM tracking is in memory and resets on restart. Transient HTTP and transport
+failures retry with exponential backoff and `Retry-After`; gateway automatic
+retries and response caching are disabled. Provider error messages are not logged
+because they may echo credentials. Provider billing remains authoritative.

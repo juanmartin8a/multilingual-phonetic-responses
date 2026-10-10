@@ -1,12 +1,12 @@
 import { test, afterEach } from 'bun:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, unlinkSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { configuration, developmentIdentity, usd } from '../lib/config.mjs';
-import { atomicJson, readJson, journal, lockState, digest } from '../lib/files.mjs';
-import { validIpa, validRespelling, validateRecords, choosePair, languagePolicy } from '../lib/data.mjs';
-import { createAI, usageCost, requestBody, reservation, ledgerTotals, outputText, retryDelay } from '../lib/ai.mjs';
+import { readJson } from '../lib/files.mjs';
+import { validIpa, validRespelling, validateRecord, choosePair, languagePolicy, validateOrderedRecords, REVIEW_OUTPUT_SCHEMA } from '../lib/data.mjs';
+import { BudgetReachedError, createAI, usageCost, requestBody, reservation, outputText, retryDelay } from '../lib/ai.mjs';
 import { populate } from '../lib/run.mjs';
 import { connect } from '../lib/db.mjs';
 
@@ -26,14 +26,17 @@ afterEach(() => {
 function fixture(extra = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'sapo-phonetics-'));
   temporaryDirectories.push(stateDir);
-  const cfg = { ...configured(['--generate', '--budget', '10'], {
+  const cfg = { ...configured(['--budget', '10'], {
     CLOUDFLARE_API_TOKEN: 'fake-gateway-token',
   }, { cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' } }), stateDir, identity, ...extra };
   return cfg;
 }
 
+const gatewaySettings = { accountId: 'a'.repeat(32), gatewayId: 'test' };
 function configured(argv = [], env = {}, settings = {}) {
-  return configuration('transcriptions', argv, env, () => typeof settings === 'string' ? settings : JSON.stringify(settings));
+  return configuration('transcriptions', argv, { CLOUDFLARE_API_TOKEN: 'fake-gateway-token', ...env },
+    () => typeof settings === 'string' ? settings : JSON.stringify({ ...settings,
+      cloudflare: { ...gatewaySettings, ...settings.cloudflare }, limits: { maxUsd: '10', ...settings.limits } }));
 }
 
 function assertNoCredentials(cfg, directory = cfg.stateDir) {
@@ -56,6 +59,7 @@ function answer(records, extra = {}) {
 }
 
 const row = (key, value = '/həˈloʊ/') => ({ key, status: 'ready', value, note: '' });
+const modelRow = (job, value = '/həˈloʊ/') => ({ index: job.index, word: job.word, status: 'ready', value, note: '' });
 
 function fakeFetch(counter, transform) {
   return async (url, options) => {
@@ -72,7 +76,9 @@ function fakeFetch(counter, transform) {
     assert.equal(body.model, 'gpt-6.1-sol');
     assert.equal(body.temperature, undefined);
     const input = JSON.parse(body.input[1].content);
-    const records = input.words.map((job) => input.target ? row(job.key, 'jelóu') : row(job.key));
+    const policy = input.target ?? (input.words.some((job) => job.note !== undefined) &&
+      JSON.parse(body.input[0].content[0].text.split('Language policies (data):\n')[1]).target);
+    const records = input.words.map((job) => policy ? modelRow(job, 'jelóu') : modelRow(job));
     return new Response(JSON.stringify(transform ? transform(records) : answer(records)), { status: 200 });
   };
 }
@@ -83,11 +89,11 @@ function fakeDatabase(entries, pageSize = 50) {
   const db = {
     calls, entries,
     languages: async () => structuredClone(languages),
-    page: async ({ languageCode, cursor, targetLanguageCode }) => {
+    page: async ({ languageCode, cursor, targetLanguageCode, numItems }) => {
       calls.pages++;
       const all = entries.filter((e) => e.language_code === languageCode);
       const offset = Number(cursor ?? 0);
-      const page = all.slice(offset, offset + pageSize).map((entry) => ({ ...structuredClone(entry),
+      const page = all.slice(offset, offset + Math.min(pageSize, numItems)).map((entry) => ({ ...structuredClone(entry),
         transcriptions: entry.transcriptions.map((ipa) => ({ ...ipa,
           hasRespelling: (ipa.targets ?? []).includes(targetLanguageCode) })),
       }));
@@ -115,31 +121,15 @@ function fakeDatabase(entries, pageSize = 50) {
 const entry = (id, code = 'en', transcriptions = []) => ({ _id: id, language_id: `${code}-id`,
   language_code: code, orthographic_form: `word-${id}`, transcriptions });
 
-test('production, project, preview, legacy and wrong-development keys fail closed', () => {
-  const read = (path) => {
-    if (path.endsWith('.env.local')) return 'CONVEX_DEPLOYMENT=dev:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud\n';
-    return 'EXPO_PUBLIC_CONVEX_URL=https://production.convex.cloud\n';
-  };
-  for (const key of ['prod:test-dev|secret', 'project:foo|secret', 'preview:foo|secret', 'secret', 'dev:wrong|secret', 'dev:test-dev|']) {
-    assert.throws(() => developmentIdentity('/project', key, read));
-  }
-  for (const key of [undefined, '', ' ']) {
-    assert.throws(() => developmentIdentity('/project', key, read), /is missing; load credentials/);
-  }
-  assert.equal(developmentIdentity('/project', 'dev:test-dev|secret', read).url, identity.url);
-  assert.throws(() => developmentIdentity('/project', 'dev:test-dev|secret', () =>
-    'CONVEX_DEPLOYMENT=prod:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud'));
-  assert.throws(() => developmentIdentity('/project', 'dev:test-dev|secret', () =>
-    'CONVEX_DEPLOYMENT=dev:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud'));
-});
-
-test('configuration is safe by default and custom models require explicit prices', () => {
+test('configuration generates by default and custom models require explicit prices', () => {
   const cfg = configured();
-  assert.equal(cfg.generate, false);
+  assert.equal(Object.hasOwn(cfg, 'generate'), false);
   assert.equal(cfg.write, false);
-  assert.equal(cfg.budget, 0);
-  assert.equal(cfg.maxPages, 1);
-  assert.throws(() => configured(['--write']));
+  assert.equal(cfg.budget, 10e9);
+  assert.equal(cfg.maxPages, 0);
+  assert.equal(configured(['--write']).write, true);
+  assert.throws(() => configured(['--generate']), /Unknown option/);
+  assert.throws(() => configured(['--rescan']), /Unknown option/);
   assert.throws(() => configured(['--provider', 'anthropic']));
   assert.throws(() => configured(['--batch-size', '0']));
   assert.throws(() => configured(['--prod']));
@@ -150,6 +140,21 @@ test('configuration is safe by default and custom models require explicit prices
   assert.throws(() => configured([], {}, { ai: { reasoningEffort: 'none' } }));
   assert.throws(() => languagePolicy(languages[0], { en: { code: 'es' } }));
   assert.throws(() => languagePolicy(languages[0], { en: { script: 'invalid-script' } }));
+});
+
+test('both scripts allow CLI and YAML batch sizes through 1000 and reject larger values', () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const config = (args, settings = {}) => configuration(task, args, { CLOUDFLARE_API_TOKEN: 'fake' },
+      () => JSON.stringify({ ...settings, cloudflare: gatewaySettings, limits: { maxUsd: '1' } }));
+    for (const batchSize of [1, 50, 51, 1000]) {
+      assert.equal(config(['--batch-size', String(batchSize)]).batchSize, batchSize);
+      assert.equal(config([], { batchSize }).batchSize, batchSize);
+    }
+    for (const batchSize of [0, 1001, 1.5]) {
+      assert.throws(() => config(['--batch-size', String(batchSize)]), /1 to 1000/);
+      assert.throws(() => config([], { batchSize }));
+    }
+  }
 });
 
 test('YAML settings, CLI overrides, and credential-only environment variables', () => {
@@ -205,7 +210,7 @@ languagePolicies:
   assert.equal(cfg.token, 'fake');
   assert.equal(cfg.openaiKey, undefined);
   assert.equal(cfg.devKey, 'dev:test-dev|fake');
-  assert.equal(cfg.generate, false);
+  assert.equal(Object.hasOwn(cfg, 'generate'), false);
   assert.equal(cfg.write, false);
   assert.equal(languagePolicy(languages[1], cfg.languagePolicies).dialect, 'Castilian Spanish');
 });
@@ -226,10 +231,8 @@ test('YAML rejects unknown settings, invalid types, invalid policies, and unsafe
   ]) assert.throws(() => configured([], {}, settings), JSON.stringify(settings));
   for (const text of ['', 'null', '[]', 'ai: [']) assert.throws(() => configured([], {}, text));
   assert.throws(() => configured([], {}, 'batchSize: .nan'));
-  assert.throws(() => configured(['--generate', '--budget', '1']), /Cloudflare/);
-  assert.throws(() => configured(['--generate'], { CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: 'fake-openai-key' }, {
-    cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' },
-  }), /positive/);
+  assert.throws(() => configured(['--budget', '1'], { CLOUDFLARE_API_TOKEN: undefined }), /Cloudflare/);
+  assert.throws(() => configured([], {}, { limits: { maxUsd: '0' } }), /positive/);
 });
 
 test('alternate YAML models require complete prices and cannot reuse another model price table', () => {
@@ -243,70 +246,6 @@ test('alternate YAML models require complete prices and cannot reuse another mod
   }
   assert.throws(() => configured(['--model', 'different-model'], {}, { ai }), /does not match/);
   assert.throws(() => configured(['--provider', 'other'], {}, { ai }), /only openai/);
-});
-
-test('generation needs only gateway credentials and ignores local OpenAI keys', () => {
-  const settings = { cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' } };
-  for (const key of [undefined, '', '   ', 'fake-openai-key']) {
-    const cfg = configured(['--generate', '--budget', '1'], {
-      CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: key,
-    }, settings);
-    assert.equal(cfg.generate, true);
-    assert.equal(cfg.openaiKey, undefined);
-  }
-  assert.throws(() => configured(['--generate', '--budget', '1'], {
-    OPENAI_API_KEY: 'fake-openai-key',
-  }, settings), /Cloudflare/);
-  assert.equal(configured([], {}, settings).generate, false);
-  for (const provider of ['anthropic', 'workers-ai']) {
-    assert.throws(() => configured([], {}, { ai: { provider } }), /only openai/);
-    assert.throws(() => createAI(fixture({ provider })), /OpenAI gateway/);
-  }
-  assert.ok(createAI(fixture()));
-  assert.throws(() => createAI(fixture({ token: undefined })), /CLOUDFLARE_API_TOKEN/);
-});
-
-test('config files are selected explicitly and YAML paths resolve relative to the selected file', () => {
-  const directory = mkdtempSync(join(tmpdir(), 'sapo-config-'));
-  temporaryDirectories.push(directory);
-  const path = join(directory, 'settings.yml');
-  writeFileSync(path, 'project: ./checkout\nstateDir: ./state\nlimits:\n  maxUsd: "0.25"\n');
-  const cfg = configuration('transcriptions', ['--config', path], {});
-  assert.equal(cfg.project, join(directory, 'checkout'));
-  assert.equal(cfg.stateDir, join(directory, 'state'));
-  assert.equal(cfg.budget, 250000000);
-  assert.equal(cfg.generate, false);
-  const overridden = configuration('transcriptions', ['--config', path, '--project', directory, '--state-dir', directory], {});
-  assert.equal(overridden.project, directory);
-  assert.equal(overridden.stateDir, directory);
-  assert.throws(() => configuration('transcriptions', ['--config', join(directory, 'missing.yml')], {}), /ENOENT/);
-  assert.deepEqual(configuration('transcriptions', ['--help', '--config', '/missing'], {}), { help: true });
-  for (const task of ['transcriptions', 'respellings']) {
-    const defaultPath = new URL(`../config/${task}.yml`, import.meta.url);
-    const defaults = configuration(task, [], {}, (selected, encoding) => {
-      assert.equal(selected, defaultPath.pathname);
-      return readFileSync(defaultPath, encoding);
-    });
-    assert.equal(defaults.budget, 1e9);
-    assert.equal(defaults.project, join(homedir(), 'development/react-native/sapo'));
-    assert.equal(defaults.generate, false);
-    assert.equal(defaults.write, false);
-    const custom = configuration(task, ['--config', path], {});
-    assert.equal(custom.budget, 250000000);
-    assert.equal(custom.stateDir, join(directory, 'state'));
-  }
-});
-
-test('script defaults load only their own settings while preserving the shared ledger', () => {
-  const settings = { transcriptions: 'batchSize: 5', respellings: 'batchSize: 10' };
-  const configs = Object.entries(settings).map(([task, text]) => configuration(task, [], {}, (selected) => {
-    assert.equal(selected, new URL(`../config/${task}.yml`, import.meta.url).pathname);
-    return text;
-  }));
-  assert.equal(configs[0].batchSize, 5);
-  assert.equal(configs[1].batchSize, 10);
-  assert.equal(configs[0].stateDir, configs[1].stateDir);
-  assert.throws(() => configuration('unknown', [], {}), /Unknown population task/);
 });
 
 test('Bun only loads explicitly selected environment files, even with NODE_ENV=production', () => {
@@ -363,13 +302,12 @@ test('exact integer costs include cache writes and do not double count reasoning
   assert.equal(chat.cost, 662000);
 });
 
-test('structured output rejects invented IDs, duplicates, counts and invalid scripts', () => {
-  const jobs = [{ key: '1' }, { key: '2' }];
-  assert.throws(() => validateRecords({ records: [row('1'), row('1')] }, jobs, 'ipa'));
-  assert.throws(() => validateRecords({ records: [row('1'), row('3')] }, jobs, 'ipa'));
-  assert.throws(() => validateRecords({ records: [row('1')] }, jobs, 'ipa'));
-  assert.throws(() => validateRecords({ records: [{ ...row('1'), extra: 1 }] }, [jobs[0]], 'ipa'));
-  assert.throws(() => validateRecords({ records: [{ key: '1', status: 'review', value: '/a/', note: 'uncertain' }] }, [jobs[0]], 'ipa'));
+test('record validation rejects invalid review states, IPA, and target scripts', () => {
+  assert.throws(() => validateRecord({ ...row('1'), status: 'review', value: '/a/', note: 'uncertain' }, 'ipa'));
+  assert.throws(() => validateRecord({ ...row('1'), note: 'extra explanation' }, 'ipa'));
+  assert.throws(() => validateRecord({ ...row('1'), status: 'unknown' }, 'ipa'));
+  assert.throws(() => validateRecord(row('1', 'not IPA'), 'ipa'));
+  assert.throws(() => validateRecord(row('1', 'こんにちは'), 'respell', target));
   assert.ok(validIpa('/həˈloʊ/'));
   assert.ok(validIpa('/ni˧˥/'));
   assert.equal(validIpa('/你好/'), false);
@@ -398,13 +336,13 @@ test('a refused/incomplete response cannot become a database result', () => {
   assert.equal(retryDelay('Thu, 01 Jan 1970 00:00:10 GMT', 0, 0), 10250);
 });
 
-test('no request can be sent when its maximum reservation exceeds budget', async () => {
+test('a batch can start below budget even when its reservation exceeds the remaining budget', async () => {
   const cfg = fixture({ budget: 1 });
   const count = { calls: 0 };
   const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  await assert.rejects(ai.generate('ipa', [{ key: '1', word: 'hello' }], source), /Budget exhausted/);
-  assert.equal(count.calls, 0);
-  assert.equal(ai.totals().committed, 0);
+  assert.equal((await ai.generate('ipa', [{ key: '1', word: 'hello' }], source)).get('1').status, 'ready');
+  assert.equal(count.calls, 1);
+  assert.equal(ai.totals().committed, 7150000);
 });
 
 test('successful output is cached per item and billed once across restart and batch-size changes', async () => {
@@ -419,44 +357,15 @@ test('successful output is cached per item and billed once across restart and ba
   ai = createAI({ ...cfg, batchSize: 1 }, { fetchFn: fakeFetch(count), log: () => {} });
   await ai.generate('ipa', jobs, source);
   assert.equal(count.calls, 1);
+  assert.equal(ai.totals().committed, 0);
   const saved = readJson(join(cfg.stateDir, 'results', readdirSync(join(cfg.stateDir, 'results'))[0]));
   assert.ok(saved.job.word);
-  assert.equal(saved.source.code, 'en');
+  assert.equal(saved.source, 'en');
   assertNoCredentials(cfg);
 });
 
-test('saved request artifact recovers a crash before settlement without a second AI request', async () => {
-  const cfg = fixture();
-  const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
-  const [reserved] = journal(join(cfg.stateDir, 'usage.jsonl'));
-  const { writeFileSync } = await import('node:fs');
-  writeFileSync(join(cfg.stateDir, 'usage.jsonl'), `${JSON.stringify(reserved)}\n`);
-  unlinkSync(join(cfg.stateDir, 'responses', `${reserved.digest}.json`));
-  for (const file of readdirSync(join(cfg.stateDir, 'results'))) unlinkSync(join(cfg.stateDir, 'results', file));
-  const resumed = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  await resumed.generate('ipa', [{ key: '1', word: 'hello' }], source);
-  assert.equal(count.calls, 1);
-  assert.equal(resumed.totals().known, ai.totals().known);
-  assert.equal(resumed.totals().uncertain, 0);
-});
-
-test('unknown billing survives restart and prevents a retry from exceeding budget', async () => {
-  const cfg = fixture();
-  const body = requestBody(cfg, readFileSync(new URL('../prompts/ipa.md', import.meta.url), 'utf8'),
-    { source, words: [{ key: '1', word: 'hello' }] });
-  cfg.budget = reservation(body, cfg).cost;
-  let calls = 0;
-  const ai = createAI(cfg, { fetchFn: async () => { calls++; throw new TypeError('network'); }, wait: async () => {}, log: () => {} });
-  await assert.rejects(ai.generate('ipa', [{ key: '1', word: 'hello' }], source), /Budget exhausted/);
-  assert.equal(calls, 1);
-  assert.equal(ai.totals().uncertain, cfg.budget);
-  assert.equal(createAI(cfg, { log: () => {} }).totals().uncertain, cfg.budget);
-});
-
 test('429 retries honor Retry-After, record uncertain cost, and settle the next attempt', async () => {
-  const cfg = fixture();
+  const cfg = fixture({ budget: 1 });
   const count = { calls: 0 };
   const success = fakeFetch(count);
   let rejected = false;
@@ -467,22 +376,9 @@ test('429 retries honor Retry-After, record uncertain cost, and settle the next 
   }, wait: async (ms) => delays.push(ms), log: () => {} });
   await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
   assert.ok(delays.includes(2250));
-  assert.equal(ai.totals().requests.size, 2);
+  assert.equal(count.calls, 1);
   assert.ok(ai.totals().uncertain > 0);
   assert.equal(ai.totals().known, 7150000);
-});
-
-test('persistent rolling RPM rate limiting survives process restart', async () => {
-  const cfg = fixture({ rpm: 1 });
-  const count = { calls: 0 };
-  let clock = 100000;
-  const waits = [];
-  const options = { fetchFn: fakeFetch(count), now: () => clock,
-    wait: async (ms) => { waits.push(ms); clock += ms; }, log: () => {} };
-  await createAI(cfg, options).generate('ipa', [{ key: '1', word: 'hello' }], source);
-  await createAI(cfg, options).generate('ipa', [{ key: '2', word: 'hello' }], source);
-  assert.equal(waits[0], 60001);
-  assert.equal(count.calls, 2);
 });
 
 test('alternate OpenAI chat models use the provider-native gateway and settle usage', async () => {
@@ -502,7 +398,7 @@ test('alternate OpenAI chat models use the provider-native gateway and settle us
     assert.equal(body.response_format.json_schema.strict, true);
     const input = JSON.parse(body.messages[1].content);
     return new Response(JSON.stringify({ usage: { prompt_tokens: 100, completion_tokens: 50 },
-      choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records: input.words.map((j) => row(j.key)) }) } }] }));
+      choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records: input.words.map((j) => modelRow(j)) }) } }] }));
   }, log: () => {} });
   await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
   assert.equal(calls, 1);
@@ -535,103 +431,45 @@ test('stored-key failures and redirects never fall back or persist echoed creden
   }
 });
 
-test('the same ledger cap applies to IPA and respelling tasks', async () => {
-  const cfg = fixture();
-  const body = requestBody(cfg, readFileSync(new URL('../prompts/respell.md', import.meta.url), 'utf8'),
-    { source, target, words: [{ key: '2', word: 'hello', ipa: '/həˈloʊ/' }] });
-  cfg.budget = reservation(body, cfg).cost;
-  const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
-  await assert.rejects(ai.generate('respell', [{ key: '2', word: 'hello', ipa: '/həˈloʊ/' }], source, target), /Budget exhausted/);
-  assert.equal(count.calls, 1);
-});
-
-test('both API formats constrain IPA and respelling keys without changing the shared schema', () => {
+test('both APIs send ordered words without database keys or hashes', () => {
   for (const api of ['responses', 'chat']) {
     const cfg = fixture({ api });
-    for (const task of ['ipa', 'respell']) {
-      const words = [{ key: 'opaque-id-1', word: 'hello' }, { key: 'opaque-id-2', word: 'hello' }];
-      const body = requestBody(cfg, task, { source, ...(task === 'respell' ? { target } : {}), words });
-      const schema = api === 'responses' ? body.text.format.schema : body.response_format.json_schema.schema;
-      assert.deepEqual(schema.properties.records.items.properties.key.enum, words.map((word) => word.key));
-      const next = requestBody(cfg, task, { source, words: [{ key: 'other-id', word: 'other' }] });
-      const nextSchema = api === 'responses' ? next.text.format.schema : next.response_format.json_schema.schema;
-      assert.deepEqual(nextSchema.properties.records.items.properties.key.enum, ['other-id']);
-      assert.deepEqual(schema.properties.records.items.properties.key.enum, ['opaque-id-1', 'opaque-id-2']);
-    }
+    const words = [{ key: 'opaque-id-1', word: 'hello', ipa: '/a/' }, { key: 'opaque-id-2', word: 'hello', ipa: '/b/' }];
+    const body = requestBody(cfg, 'prompt', { source, target, words });
+    const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
+    assert.deepEqual(input.words, [{ index: 0, word: 'hello', ipa: '/a/' }, { index: 1, word: 'hello', ipa: '/b/' }]);
+    assert.equal(JSON.stringify(body).includes('opaque-id'), false);
   }
 });
 
-test('both generation tasks reject mistyped and duplicate keys with diagnostics, retaining billing', async () => {
-  for (const task of ['ipa', 'respell']) {
-    for (const failure of ['unknown', 'duplicate', 'malformed']) {
-      const cfg = fixture();
-      const count = { calls: 0 };
-      const jobs = [{ key: 'id-1', word: 'hello', ipa: '/a/' }, { key: 'id-2', word: 'hi', ipa: '/b/' }];
-      const fetchFn = fakeFetch(count, (rows) => {
-        if (failure === 'unknown') rows[1].key = 'id-2-typo';
-        if (failure === 'duplicate') rows[1].key = rows[0].key;
-        if (failure === 'malformed') rows[1].extra = true;
-        return answer(rows);
-      });
-      const ai = createAI(cfg, { fetchFn, log: () => {} });
-      const rejection = new RegExp(`${task} batch rejected: ${failure === 'unknown' ? 'Unknown key' : failure === 'duplicate' ? 'Duplicate key' : 'Malformed record'} at index 1.*saved response:`);
-      await assert.rejects(ai.generate(task, jobs, source, task === 'respell' ? target : null), rejection);
-      assert.equal(ai.totals().known, 7150000);
-      assert.equal(readdirSync(join(cfg.stateDir, 'responses')).length, 1);
-      assert.equal(readJson(join(cfg.stateDir, 'results')), undefined);
-      const resumed = createAI(cfg, { fetchFn, log: () => {} });
-      await assert.rejects(resumed.generate(task, jobs, source, task === 'respell' ? target : null), rejection);
-      assert.equal(count.calls, 1, 'Rejected responses remain charged and cached after restart');
-      assert.equal(resumed.totals().known, 7150000);
-    }
+test('ordered validation rejects shifts, spelling normalization and invalid values per item', () => {
+  const jobs = [{ key: '1', word: 'é' }, { key: '2', word: 'hello' }];
+  const rows = jobs.map((j, index) => modelRow({ ...j, index }));
+  for (const bad of [{ ...rows[0], word: 'é' }, { ...rows[0], index: 1 }, { ...rows[0], value: 'bad' }]) {
+    const result = validateOrderedRecords({ records: [bad, rows[1]] }, jobs, 'ipa');
+    assert.deepEqual(result.records.map((r) => r.key), ['2']);
+    assert.equal(result.rejected[0].job.key, '1');
   }
+  for (const records of [rows.slice(1), [...rows, rows[0]], [...rows].reverse()]) {
+    const result = validateOrderedRecords({ records }, jobs, 'ipa');
+    assert.equal(result.records.length, 0);
+    assert.equal(result.rejected.length, 2);
+  }
+  const repeated = [{ key: 'a', word: 'read', ipa: '/riːd/' }, { key: 'b', word: 'read', ipa: '/rɛd/' }];
+  const result = validateOrderedRecords({ records: repeated.map((j, index) => modelRow({ ...j, index }, index ? 'red' : 'rid')) }, repeated, 'respell', target);
+  assert.deepEqual(result.records.map((r) => [r.key, r.value]), [['a', 'rid'], ['b', 'red']]);
 });
 
-test('constrained requests bypass legacy bad responses while reusing valid item results', async () => {
-  const cfg = fixture();
-  const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  const jobs = [{ key: 'id-1', word: 'hello' }, { key: 'id-2', word: 'hi' }];
-  await ai.generate('ipa', [jobs[0]], source);
-  const prompt = readFileSync(new URL('../prompts/ipa.md', import.meta.url), 'utf8');
-  const legacyBody = requestBody(cfg, prompt, { source, words: [jobs[1]] });
-  delete legacyBody.text.format.schema.properties.records.items.properties.key.enum;
-  const url = `https://gateway.ai.cloudflare.com/v1/${cfg.account}/${cfg.gateway}/openai/responses`;
-  const legacyPath = join(cfg.stateDir, 'responses', `${digest([url, legacyBody])}.json`);
-  atomicJson(legacyPath, answer([row('id-2-typo')]));
-  const results = await ai.generate('ipa', jobs, source);
-  assert.deepEqual([...results.keys()], ['id-1', 'id-2']);
-  assert.equal(count.calls, 2, 'Only the uncached item needs a new constrained request');
-  assert.equal(JSON.parse(outputText(readJson(legacyPath), cfg.api)).records[0].key, 'id-2-typo');
-  assert.equal(ai.totals().known, 14300000);
-});
-
-test('missing usage and malformed model output stop before result caching', async () => {
+test('missing usage stops before result caching', async () => {
   const cfg = fixture();
   const count = { calls: 0 };
   const ai = createAI(cfg, { fetchFn: fakeFetch(count, (rows) => answer(rows, { usage: undefined })), log: () => {} });
   await assert.rejects(ai.generate('ipa', [{ key: '1', word: 'hello' }], source), /Missing usage/);
   assert.ok(ai.totals().uncertain > 0);
-  const other = fixture();
-  const wrong = createAI(other, { fetchFn: fakeFetch(count, () => answer([row('invented')])), log: () => {} });
-  await assert.rejects(wrong.generate('ipa', [{ key: '1', word: 'hello' }], source), /key/);
-  assert.equal(wrong.totals().known, 7150000);
-  await assert.rejects(wrong.generate('ipa', [{ key: '1', word: 'hello' }], source), /key/);
-  assert.equal(count.calls, 2, 'Malformed responses are not automatically regenerated');
+
 });
 
-test('read-only planning makes no generation or mutation calls', async () => {
-  const cfg = fixture({ generate: false, write: false, maxPages: 1 });
-  const db = fakeDatabase([entry('1')]);
-  await populate('transcriptions', cfg, db, null, { log: () => {} });
-  assert.equal(db.calls.ipa, 0);
-  assert.equal(db.calls.respell, 0);
-  assert.equal(db.calls.pages, 1);
-});
-
-test('IPA population covers all languages, preserves existing variants and caches reviewed words', async () => {
+test('IPA population covers all languages and preserves existing variants', async () => {
   const cfg = fixture({ write: true });
   const db = fakeDatabase([entry('1'), entry('2', 'en', [{ _id: 'old', transcription: '/old/', targets: [] }]), entry('3', 'es')]);
   const count = { calls: 0 };
@@ -640,88 +478,456 @@ test('IPA population covers all languages, preserves existing variants and cache
   assert.equal(db.entries[1].transcriptions[0].transcription, '/old/');
   assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
   assert.equal(count.calls, 2);
-  await populate('transcriptions', { ...cfg, rescan: true }, db, ai, { log: () => {} });
+  await populate('transcriptions', cfg, db, ai, { log: () => {} });
   assert.equal(count.calls, 2);
   assert.equal(db.entries[1].transcriptions.length, 1);
 });
 
-test('generation-only respellings include missing IPA; applying reuses results with real links', async () => {
-  const cfg = fixture({ write: false });
+test('both scripts finalize reviews before writing and skip inserted results on restart', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write: true, batchSize: 1, rpm: 1000, tpm: 1e9 });
+    const db = fakeDatabase([entry('1'), entry('2')]);
+    const count = { calls: 0 };
+    const ai = createAI(cfg, { fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) => count.calls % 2 ?
+      { ...r, status: 'review', value: null, note: 'Ambiguous without context' } : r))), log: () => {} });
+    await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
+    assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+    const before = count.calls;
+    assert.equal(before, task === 'respellings' ? 8 : 4);
+    const resumed = createAI(cfg, { fetchFn: () => { throw new Error('Unexpected repeat generation'); }, log: () => {} });
+    await populate(task, cfg, db, resumed, { select: () => 0, log: () => {} });
+    assert.equal(count.calls, before);
+  }
+});
+
+test('both APIs review only flagged words and notes with the same model and a different definitive prompt', async () => {
+  for (const api of ['responses', 'chat']) {
+    for (const task of ['ipa', 'respell']) {
+      const cfg = fixture({ api });
+      const requests = [];
+      const jobs = [{ key: 'local-1', word: 'read' }, { key: 'local-2', word: 'hello' }, { key: 'local-3', word: 'read' }]
+        .map((job, index) => ({ ...job, ...(task === 'respell' ? { ipa: index ? '/rɛd/' : '/riːd/' } : {}) }));
+      const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
+        const body = JSON.parse(options.body);
+        requests.push(body);
+        const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
+        const records = input.words.map((job, index) => requests.length === 1 && index !== 1 ?
+          { index, word: job.word, status: 'review', value: null, note: `Resolve variant ${index}` } :
+          modelRow(job, task === 'ipa' ? '/riːd/' : 'rid'));
+        return new Response(JSON.stringify(api === 'responses' ? answer(records) : {
+          id: 'chat-answer', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records }) } }],
+          usage: { prompt_tokens: 2000, completion_tokens: 500, prompt_tokens_details: { cached_tokens: 1000, cache_write_tokens: 100 } },
+        }));
+      } });
+      const result = await ai.generate(task, jobs, source, task === 'respell' ? target : null);
+      assert.equal(requests.length, 2);
+      const [first, second] = requests;
+      assert.equal(second.model, first.model);
+      const prompt = (body) => api === 'responses' ? body.input[0].content[0].text : body.messages[0].content;
+      assert.notEqual(prompt(first), prompt(second));
+      assert.equal(api === 'responses' ? second.input.length : second.messages.length, 2);
+      assert.deepEqual(api === 'responses' ? second.text.format.schema : second.response_format.json_schema.schema, REVIEW_OUTPUT_SCHEMA);
+      const input = JSON.parse(api === 'responses' ? second.input[1].content : second.messages[1].content);
+      assert.deepEqual(Object.keys(input), ['words']);
+      assert.deepEqual(input.words, [0, 2].map((original, index) => ({ index, word: 'read',
+        ...(task === 'respell' ? { ipa: jobs[original].ipa } : {}), note: `Resolve variant ${original}` })));
+      assert.equal(JSON.stringify(second).includes('hello'), false);
+      assert.equal(JSON.stringify(second).includes('local-'), false);
+      assert.equal(result.size, 3);
+      assert.ok([...result.values()].every((record) => record.status === 'ready'));
+      assert.equal(ai.totals().known, 2 * 7150000);
+      const saved = readdirSync(join(cfg.stateDir, 'results')).map((file) => readJson(join(cfg.stateDir, 'results', file)));
+      assert.equal(saved.length, 3);
+      assert.ok(saved.every((item) => typeof item.value === 'string' && !Object.hasOwn(item, 'firstPassRecord')));
+    }
+  }
+});
+
+test('review output must be definitive, correctly aligned and valid before any database write', async () => {
+  const invalid = [
+    (r) => ({ ...r, status: 'review', value: null, note: 'Still unsure' }),
+    (r) => ({ ...r, value: null }),
+    (r) => ({ ...r, value: 'not IPA' }),
+    (r) => ({ ...r, word: 'wrong' }),
+    (r) => ({ ...r, index: 1 }),
+    (r) => ({ ...r, note: 'Explanation' }),
+  ];
+  for (const transform of invalid) {
+    const cfg = fixture({ write: true });
+    const db = fakeDatabase([entry('1')]);
+    const count = { calls: 0 };
+    const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
+      count.calls === 1 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : transform(r)))) });
+    await assert.rejects(populate('transcriptions', cfg, db, ai, { log: () => {} }), /review pass rejected/);
+    assert.equal(db.calls.ipa, 0);
+    assert.deepEqual(readdirSync(cfg.stateDir), []);
+    assert.equal(count.calls, 2);
+  }
+});
+
+test('1000-word batches span Convex pages for both scripts while mutation sizes remain bounded', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write: true, batchSize: 1000, budget: 100e9, rpm: 1000, tpm: 1e9 });
+    const db = fakeDatabase(Array.from({ length: 1001 }, (_, i) => entry(String(i))));
+    const page = db.page;
+    const mutations = [db.insertTranscriptions, db.insertRespellings];
+    db.page = async (args) => { assert.ok(args.numItems <= 50); return page(args); };
+    [db.insertTranscriptions, db.insertRespellings] = mutations.map((insert) => async (rows) => {
+      assert.ok(rows.length <= 50);
+      return insert(rows);
+    });
+    const batches = [];
+    const count = { calls: 0 };
+    const fetcher = fakeFetch(count);
+    const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+      batches.push(JSON.parse(JSON.parse(options.body).input[1].content).words.length);
+      return fetcher(url, options);
+    } });
+    await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
+    assert.deepEqual(batches, task === 'transcriptions' ? [1000, 1] : [1000, 1000, 1, 1]);
+    assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+  }
+});
+
+test('long review notes are split to fit TPM reservations and every flagged item is finalized', async () => {
+  const cfg = fixture({ batchSize: 1000, rpm: 1000, tpm: 100000, budget: 1 });
+  const jobs = Array.from({ length: 200 }, (_, i) => ({ key: `key-${i}`, word: `word-${i}` }));
+  let time = Date.now();
+  const requests = [];
+  const count = { calls: 0 };
+  const fetcher = fakeFetch(count, (rows) => answer(rows.map((r) => count.calls === 1 ?
+    { ...r, status: 'review', value: null, note: 'x'.repeat(500) } : r)));
+  const ai = createAI(cfg, { log: () => {}, now: () => time, wait: async (ms) => { time += ms; },
+    fetchFn: (url, options) => {
+      const body = JSON.parse(options.body);
+      assert.ok(reservation(body, cfg).tokens <= cfg.tpm);
+      requests.push(JSON.parse(body.input[1].content).words);
+      return fetcher(url, options);
+    },
+  });
+  const result = await ai.generate('ipa', jobs, source);
+  assert.equal(result.size, jobs.length);
+  assert.ok([...result.values()].every((record) => record.status === 'ready'));
+  assert.equal(requests[0].length, 200);
+  assert.ok(requests.length > 2);
+  assert.deepEqual(requests.slice(1).flat().map((job) => job.word), jobs.map((job) => job.word));
+  assert.ok(requests.slice(1).flat().every((job) => job.note === 'x'.repeat(500)));
+});
+
+
+test('development identity rejects production, project, preview, and mismatched keys', () => {
+  const read = (path) => path.endsWith('.env.local') ?
+    'CONVEX_DEPLOYMENT=dev:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud\n' :
+    'EXPO_PUBLIC_CONVEX_URL=https://production.convex.cloud\n';
+  for (const key of [undefined, '', ' ', 'prod:test-dev|secret', 'project:foo|secret',
+    'preview:foo|secret', 'secret', 'dev:wrong|secret', 'dev:test-dev|']) {
+    assert.throws(() => developmentIdentity('/project', key, read));
+  }
+  assert.equal(developmentIdentity('/project', 'dev:test-dev|secret', read).url, identity.url);
+  assert.throws(() => developmentIdentity('/project', 'dev:test-dev|secret', () =>
+    'CONVEX_DEPLOYMENT=prod:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud'));
+  assert.throws(() => developmentIdentity('/project', 'dev:test-dev|secret', () =>
+    'CONVEX_DEPLOYMENT=dev:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud'));
+});
+
+test('generation always requires gateway credentials and a positive per-run budget', () => {
+  const read = () => JSON.stringify({ cloudflare: gatewaySettings, limits: { maxUsd: '1' } });
+  assert.throws(() => configuration('transcriptions', [], {}, read), /Cloudflare/);
+  assert.throws(() => configured([], {}, { cloudflare: { accountId: undefined } }), /Cloudflare/);
+  assert.throws(() => configured(['--budget', '0']), /positive/);
+  assert.throws(() => createAI(fixture({ token: undefined })), /CLOUDFLARE_API_TOKEN/);
+  const cfg = configured([], { OPENAI_API_KEY: 'unused' });
+  assert.equal(cfg.openaiKey, undefined);
+  assert.equal(cfg.maxPages, 0);
+});
+
+test('config paths are selected per script and resolve relative YAML paths', () => {
+  const cfg = fixture();
+  const path = join(cfg.stateDir, 'config.yml');
+  writeFileSync(path, JSON.stringify({ project: './checkout', stateDir: './results',
+    cloudflare: gatewaySettings, limits: { maxUsd: '0.25' } }));
+  const env = { CLOUDFLARE_API_TOKEN: 'fake' };
+  for (const task of ['transcriptions', 'respellings']) {
+    const selected = configuration(task, ['--config', path], env);
+    assert.equal(selected.project, join(cfg.stateDir, 'checkout'));
+    assert.equal(selected.stateDir, join(cfg.stateDir, 'results'));
+    assert.equal(selected.budget, 250000000);
+    const overridden = configuration(task, ['--config', path, '--state-dir', cfg.stateDir], env);
+    assert.equal(overridden.stateDir, cfg.stateDir);
+    const defaults = configuration(task, [], env, (file) => {
+      assert.equal(file, new URL(`../config/${task}.yml`, import.meta.url).pathname);
+      return JSON.stringify({ cloudflare: gatewaySettings, limits: { maxUsd: '1' } });
+    });
+    assert.equal(defaults.project, join(homedir(), 'development/react-native/sapo'));
+  }
+  assert.deepEqual(configuration('transcriptions', ['--help', '--config', '/missing'], {}), { help: true });
+  assert.throws(() => configuration('unknown', [], env), /Unknown population task/);
+});
+
+function snapshot(directory) {
+  return Object.fromEntries(readdirSync(directory, { withFileTypes: true }).flatMap((file) => {
+    const path = join(directory, file.name);
+    return file.isDirectory() ? Object.entries(snapshot(path)).map(([name, value]) => [`${file.name}/${name}`, value]) :
+      [[file.name, readFileSync(path, 'utf8')]];
+  }));
+}
+
+test('default mode saves only finalized values and the minimal respelling pair', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture();
+    const db = fakeDatabase([entry('1')]);
+    const count = { calls: 0 };
+    const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) =>
+      answer(rows.map((r) => count.calls % 2 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : r))) });
+    await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
+    assert.equal(db.calls.ipa, 0);
+    assert.equal(db.calls.respell, 0);
+    assert.deepEqual(readdirSync(cfg.stateDir).sort(), task === 'transcriptions' ? ['results'] : ['respelling-pair.json', 'results']);
+    const files = readdirSync(join(cfg.stateDir, 'results'));
+    assert.equal(files.length, task === 'transcriptions' ? 1 : 2);
+    for (const file of files) {
+      const item = readJson(join(cfg.stateDir, 'results', file));
+      assert.deepEqual(Object.keys(item).sort(), item.task === 'ipa' ?
+        ['job', 'signature', 'source', 'task', 'value'] : ['job', 'signature', 'source', 'target', 'task', 'value']);
+      assert.equal(item.source, 'en');
+      assert.equal(item.signature.length, 64);
+      assert.equal(item.job.key.length > 0, true);
+      assert.equal(item.job.word, 'word-1');
+      assert.ok(typeof item.value === 'string');
+    }
+    if (task === 'respellings') assert.deepEqual(readJson(join(cfg.stateDir, 'respelling-pair.json')), { source: 'en', target: 'es' });
+    assertNoCredentials(cfg);
+    const before = snapshot(cfg.stateDir);
+    await populate(task, cfg, db, createAI(cfg, { log: () => {}, fetchFn: () => { throw new Error('Cache must be reused'); } }),
+      { select: () => { throw new Error('Pair must be reused'); }, log: () => {} });
+    assert.deepEqual(snapshot(cfg.stateDir), before);
+  }
+});
+
+test('write mode creates no state directory for either script', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const root = fixture();
+    const cfg = { ...root, write: true, stateDir: join(root.stateDir, 'absent') };
+    const db = fakeDatabase([entry('1'), entry('2')]);
+    const count = { calls: 0 };
+    await populate(task, cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }),
+      { select: () => 0, log: () => {} });
+    assert.deepEqual(readdirSync(root.stateDir), []);
+    assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+  }
+});
+
+test('write mode reads existing local results and pair without modifying any files', async () => {
+  const cfg = fixture();
   const db = fakeDatabase([entry('1'), entry('2', 'en', [
     { _id: 'old-1', transcription: '/a/', targets: ['es'] },
     { _id: 'old-2', transcription: '/b/', targets: [] },
   ])]);
   const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
   const options = { select: () => 0, log: () => {} };
-  await populate('respellings', cfg, db, ai, options);
-  assert.equal(db.calls.ipa, 0);
-  assert.equal(db.calls.respell, 0);
+  await populate('respellings', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), options);
   assert.equal(count.calls, 2);
-  const pair = readJson(join(cfg.stateDir, 'respelling-pair.json'));
-  await populate('respellings', { ...cfg, write: true }, db, ai, { ...options, select: () => { throw new Error('Must not reselect'); } });
-  assert.equal(count.calls, 2, 'Temporary and real IPA IDs share stable item cache keys');
+  const before = snapshot(cfg.stateDir);
+  const writing = { ...cfg, write: true };
+  const ai = createAI(writing, { log: () => {}, fetchFn: () => { throw new Error('No paid regeneration'); } });
+  await populate('respellings', writing, db, ai, { log: () => {}, select: () => { throw new Error('Must reuse saved pair'); } });
+  assert.equal(ai.totals().committed, 0);
   assert.ok(db.entries.flatMap((e) => e.transcriptions).every((ipa) => ipa.targets.includes('es')));
-  assert.deepEqual(readJson(join(cfg.stateDir, 'respelling-pair.json')), pair);
-  await populate('respellings', { ...cfg, write: true, rescan: true }, db, ai, options);
-  assert.equal(count.calls, 2);
+  assert.deepEqual(snapshot(cfg.stateDir), before);
 });
 
-test('pagination resumes at the committed boundary after a limited write run', async () => {
-  const cfg = fixture({ write: true, maxPages: 1 });
-  const db = fakeDatabase([entry('1'), entry('2')], 1);
-  const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  await populate('transcriptions', cfg, db, ai, { log: () => {} });
-  assert.equal(db.entries[0].transcriptions.length, 1);
-  assert.equal(db.entries[1].transcriptions.length, 0);
-  const saved = readJson(join(cfg.stateDir, 'transcriptions.write.json'));
-  assert.equal(saved.cursor, '1');
-  await populate('transcriptions', cfg, db, ai, { log: () => {} });
-  assert.equal(db.entries[1].transcriptions.length, 1);
-  assert.equal(count.calls, 2);
+test('each AI batch is reviewed and inserted before the next generation batch for both scripts', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write: true, batchSize: 1 });
+    const db = fakeDatabase([entry('1'), entry('2')].map((e, i) => task === 'respellings' ?
+      { ...e, transcriptions: [{ _id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
+    const events = [];
+    const field = task === 'transcriptions' ? 'insertTranscriptions' : 'insertRespellings';
+    const insert = db[field];
+    db[field] = async (rows) => { events.push('insert'); return insert(rows); };
+    const count = { calls: 0 };
+    const fetcher = fakeFetch(count, (rows) => answer(rows.map((r) => count.calls % 2 ?
+      { ...r, status: 'review', value: null, note: 'Two readings' } : r)));
+    const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+      const input = JSON.parse(JSON.parse(options.body).input[1].content);
+      events.push(input.words[0].note ? 'review' : 'generate');
+      return fetcher(url, options);
+    } });
+    await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
+    assert.deepEqual(events, ['generate', 'review', 'insert', 'generate', 'review', 'insert']);
+    assert.deepEqual(readdirSync(cfg.stateDir), []);
+  }
 });
 
-test('a mutation that commits before a network failure is safe to resume without paid regeneration', async () => {
-  const cfg = fixture({ write: true });
-  const db = fakeDatabase([entry('1')]);
-  const insert = db.insertRespellings;
-  let failed = false;
-  db.insertRespellings = async (rows) => {
-    await insert(rows);
-    if (!failed) { failed = true; throw new Error('network after commit'); }
+test('earlier write batches survive an insertion failure and restart generates only missing data', async () => {
+  const cfg = fixture({ write: true, batchSize: 1 });
+  const db = fakeDatabase([entry('1'), entry('2'), entry('3')]);
+  const insert = db.insertTranscriptions;
+  db.insertTranscriptions = async (rows) => {
+    if (db.calls.ipa === 1) throw new Error('database unavailable');
+    return insert(rows);
   };
   const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  const options = { select: () => 0, log: () => {} };
-  await assert.rejects(populate('respellings', cfg, db, ai, options), /network/);
-  await populate('respellings', cfg, db, ai, options);
+  await assert.rejects(populate('transcriptions', cfg, db,
+    createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} }), /database unavailable/);
   assert.equal(count.calls, 2);
-  assert.equal(db.entries[0].transcriptions.length, 1);
-  assert.deepEqual(db.entries[0].transcriptions[0].targets, ['es']);
+  assert.equal(db.entries.filter((e) => e.transcriptions.length).length, 1);
+  assert.deepEqual(readdirSync(cfg.stateDir), []);
+  db.insertTranscriptions = insert;
+  await populate('transcriptions', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
+  assert.equal(count.calls, 4);
+  assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
 });
 
-test('ambiguous review items remain local and never become rows', async () => {
-  const cfg = fixture({ write: true });
-  const db = fakeDatabase([entry('1')]);
-  const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
-    ({ key: r.key, status: 'review', value: null, note: 'Ambiguous without context' })))), log: () => {} });
-  await populate('transcriptions', cfg, db, ai, { log: () => {} });
-  assert.equal(db.calls.ipa, 0);
-  await populate('transcriptions', { ...cfg, rescan: true }, db, ai, { log: () => {} });
-  assert.equal(count.calls, 1);
+test('each restart gets a fresh budget and discovers progress from the database or local cache', async () => {
+  for (const write of [false, true]) {
+    for (const task of ['transcriptions', 'respellings']) {
+      const cfg = fixture({ write, batchSize: 1, budget: 1 });
+      const db = fakeDatabase([entry('1'), entry('2')].map((e, i) => task === 'respellings' ?
+        { ...e, transcriptions: [{ _id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
+      const count = { calls: 0 };
+      for (let run = 1; run <= 2; run++) {
+        const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
+        assert.equal(ai.totals().committed, 0);
+        await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
+        assert.equal(count.calls, run);
+        assert.equal(ai.totals().known, 7150000);
+      }
+      if (write) assert.deepEqual(readdirSync(cfg.stateDir), []);
+      else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 2);
+    }
+  }
 });
 
-test('exclusive locks, deployment isolation and corrupt journals fail closed', async () => {
+test('retries and uncertain costs count within a run but no history survives restart', async () => {
+  const cfg = fixture({ write: true, attempts: 2, budget: 1 });
+  let calls = 0;
+  const ai = createAI(cfg, { fetchFn: async () => { calls++; throw new TypeError('network'); }, wait: async () => {}, log: () => {} });
+  await assert.rejects(ai.generate('ipa', [{ key: '1', word: 'hello' }], source), /transport failed/);
+  assert.equal(calls, 2);
+  assert.ok(ai.totals().uncertain > 0);
+  await assert.rejects(ai.generate('ipa', [{ key: '2', word: 'bye' }], source), BudgetReachedError);
+  assert.deepEqual(readdirSync(cfg.stateDir), []);
+  const next = createAI(cfg, { log: () => {} });
+  assert.equal(next.totals().committed, 0);
+});
+
+test('rate limiting is rolling within one run and resets on restart', async () => {
+  const cfg = fixture({ rpm: 1, write: true });
+  const count = { calls: 0 }, waits = [];
+  let time = 100000;
+  const options = { fetchFn: fakeFetch(count), now: () => time,
+    wait: async (ms) => { waits.push(ms); time += ms; }, log: () => {} };
+  const ai = createAI(cfg, options);
+  await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
+  await ai.generate('ipa', [{ key: '2', word: 'hi' }], source);
+  assert.deepEqual(waits, [60001]);
+  await createAI(cfg, options).generate('ipa', [{ key: '3', word: 'bye' }], source);
+  assert.deepEqual(waits, [60001]);
+  assert.deepEqual(readdirSync(cfg.stateDir), []);
+});
+
+test('cache signatures distinguish deployment, model settings, policies, and exact IPA variants', async () => {
   const cfg = fixture();
-  const unlock = lockState(cfg.stateDir);
-  assert.throws(() => lockState(cfg.stateDir), /locked/);
-  unlock();
-  atomicJson(join(cfg.stateDir, 'deployment.json'), { url: 'https://other.convex.cloud' });
-  await assert.rejects(populate('transcriptions', cfg, fakeDatabase([]), null, { log: () => {} }), /another deployment/);
-  assert.throws(() => ledgerTotals([{ type: 'settle', id: 'absent', usage: { cost: 0 } }]));
-  const { writeFileSync } = await import('node:fs');
-  writeFileSync(join(cfg.stateDir, 'usage.jsonl'), '{"type":"reserve"');
-  assert.throws(() => createAI(cfg), /incomplete/);
+  const count = { calls: 0 };
+  const jobs = [{ key: '1', word: 'hello' }];
+  const options = { fetchFn: fakeFetch(count), log: () => {} };
+  await createAI(cfg, options).generate('ipa', jobs, source);
+  await createAI(cfg, options).generate('ipa', jobs, source);
+  assert.equal(count.calls, 1);
+  await createAI({ ...cfg, identity: { url: 'https://other-dev.convex.cloud' } }, options).generate('ipa', jobs, source);
+  await createAI(cfg, options).generate('ipa', jobs, { ...source, dialect: 'British English' });
+  const fetcher = fakeFetch(count);
+  await createAI({ ...cfg, effort: 'medium' }, { log: () => {}, fetchFn: (url, options) => {
+    const body = JSON.parse(options.body);
+    assert.deepEqual(body.reasoning, { effort: 'medium' });
+    body.reasoning.effort = 'high';
+    return fetcher(url, { ...options, body: JSON.stringify(body) });
+  } }).generate('ipa', jobs, source);
+  for (const ipa of ['/a/', '/b/']) {
+    await createAI(cfg, options).generate('respell', [{ key: '1', word: 'hello', ipa }], source, target);
+  }
+  assert.equal(count.calls, 6);
+});
+
+test('invalid items are skipped without storing rejections and retry naturally on the next scan', async () => {
+  for (const write of [false, true]) {
+    const cfg = fixture({ write });
+    const db = fakeDatabase([entry('1'), entry('2')]);
+    const count = { calls: 0 };
+    await populate('transcriptions', cfg, db, createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count,
+      (rows) => answer(rows.map((r, i) => i ? { ...r, word: 'mismatch' } : r))) }), { log: () => {} });
+    if (write) assert.equal(db.entries.filter((e) => e.transcriptions.length).length, 1);
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 1);
+    await populate('transcriptions', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
+    assert.equal(count.calls, 2);
+    assert.deepEqual(readdirSync(cfg.stateDir), write ? [] : ['results']);
+  }
+});
+
+test('failed review saves no intermediate result and the next run starts generation again', async () => {
+  for (const write of [false, true]) {
+    const cfg = fixture({ write, attempts: 1 });
+    const db = fakeDatabase([entry('1')]);
+    const count = { calls: 0 };
+    const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => {
+      if (count.calls === 2) throw new TypeError('network');
+      return answer(rows.map((r) => ({ ...r, status: 'review', value: null, note: 'Ambiguous' })));
+    }) });
+    await assert.rejects(populate('transcriptions', cfg, db, ai, { log: () => {} }), /transport failed/);
+    assert.deepEqual(readdirSync(cfg.stateDir), []);
+    assert.equal(db.calls.ipa, 0);
+    await populate('transcriptions', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
+    assert.equal(count.calls, 3);
+  }
+});
+
+test('a page limit stops scanning without saving progress and the next invocation scans from the start', async () => {
+  const cfg = fixture({ write: true, batchSize: 1000, maxPages: 2 });
+  const db = fakeDatabase(Array.from({ length: 125 }, (_, i) => entry(String(i))));
+  const count = { calls: 0 };
+  await populate('transcriptions', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
+  assert.equal(db.entries.filter((e) => e.transcriptions.length).length, 100);
+  assert.equal(count.calls, 1);
+  assert.deepEqual(readdirSync(cfg.stateDir), []);
+  const full = { ...cfg, maxPages: 0 };
+  await populate('transcriptions', full, db, createAI(full, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
+  assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+  assert.equal(count.calls, 2);
+});
+
+test('duplicate pronunciation documents share one result and get separate database links', async () => {
+  const cfg = fixture({ write: true });
+  const db = fakeDatabase([entry('1', 'en', [
+    { _id: 'ipa-a', transcription: '/a/', targets: [] },
+    { _id: 'ipa-duplicate', transcription: '/a/', targets: [] },
+    { _id: 'ipa-b', transcription: '/b/', targets: [] },
+  ])]);
+  const count = { calls: 0 };
+  const fetcher = fakeFetch(count);
+  const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+    const input = JSON.parse(JSON.parse(options.body).input[1].content);
+    assert.deepEqual(input.words.map((job) => job.ipa), ['/a/', '/b/']);
+    return fetcher(url, options);
+  } });
+  await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
+  assert.equal(count.calls, 1);
+  assert.ok(db.entries[0].transcriptions.every((ipa) => ipa.targets.includes('es')));
+  assert.deepEqual(readdirSync(cfg.stateDir), []);
+});
+
+test('an admitted batch finishes all reviews beyond the budget and is inserted before stopping', async () => {
+  const cfg = fixture({ write: true, budget: 1, batchSize: 1 });
+  const db = fakeDatabase([entry('1'), entry('2')]);
+  const count = { calls: 0 };
+  const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
+    count.calls === 1 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : r))) });
+  await populate('transcriptions', cfg, db, ai, { log: () => {} });
+  assert.equal(count.calls, 2);
+  assert.equal(ai.totals().committed, 14300000);
+  assert.equal(db.entries.filter((e) => e.transcriptions.length).length, 1);
+  assert.deepEqual(readdirSync(cfg.stateDir), []);
 });
